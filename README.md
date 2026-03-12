@@ -332,8 +332,6 @@ MTS-O1-Embedder/
 │   ├── NATOPS/                    # NATOPS dataset (.npy files)
 │   └── README_GENERALIZATION.md   # Guide for adding new datasets
 │
-├── MTS-O1-Embedder_Technical_Doc.md
-├── O1-Embedder.md
 ├── requirements.txt
 └── README.md
 ```
