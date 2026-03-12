@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+
+# Temporary local patch scripts
+patch*.py
+
+# Local evaluation artifacts
+retrieval_index.pkl
+eval_results*.txt
+result.txt
+
+# Model weights and checkpoints (too large for git)
+local_model/
+checkpoints*/
+*.pt
+*.safetensors
+*.bin
+
+# API keys / secrets
+.env
+secrets.json
+
+# Raw run logs
+运行结果.md
+*.log
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

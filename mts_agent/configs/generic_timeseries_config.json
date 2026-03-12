@@ -1,0 +1,59 @@
+{
+  "experiment_name": "generic_timeseries_alignment",
+  "mode": "train",
+  "data": {
+    "data_path": "mts_agent/data/processed/generic_train.jsonl",
+    "raw_data_path": "path/to/your/dataset_folder_or_file",
+    "dataset_name": "GenericTimeSeries",
+    "batch_size": 4,
+    "ts_dim": null,
+    "augment": true,
+    "max_length": 256,
+    "domain_info": "Generic multivariate time-series dataset with variable length sensor observations."
+  },
+  "model": {
+    "llm_path": "local_model",
+    "ts_input_dim": null,
+    "ts_hidden_dim": 128,
+    "encoder_base_channels": 64,
+    "encoder_target_tokens": 16,
+    "encoder_dropout": 0.1,
+    "encoder_norm": "group",
+    "tuning_strategy": "lora",
+    "num_trainable_layers": 2
+  },
+  "training": {
+    "seed": 42,
+    "epochs": 10,
+    "lr": 0.0001,
+    "gradient_accumulation_steps": 1,
+    "early_stopping_patience": 3,
+    "early_stopping_min_delta": 0.0,
+    "training_stage": "alignment",
+    "contrastive_weight": 0.7,
+    "neighbor_weight": 0.0,
+    "neighbor_margin": 0.1,
+    "lm_weight": 0.3,
+    "save_dir": "checkpoints_generic",
+    "ckpt_path": null
+  },
+  "retrieval": {
+    "k": 5,
+    "alpha": 0.8,
+    "dtw_window_size": null,
+    "fast_dtw_max_len": 100
+  },
+  "inference": {
+    "max_new_tokens": 200,
+    "temperature": 0.7,
+    "do_sample": false,
+    "use_api": false,
+    "api_key": null
+  },
+  "environment": {
+    "disable_ssl_verify": false,
+    "force_offline": true,
+    "use_dummy_tokenizer": false,
+    "device": "cuda"
+  }
+}
