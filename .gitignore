@@ -33,6 +33,9 @@ Thumbs.db
 .idea/
 .claude/
 
+# Local documentation (not tracked)
+docs/
+
 # Raw datasets (too large, download separately)
 UEA_Archive/
 mts_agent/NATOPS/
