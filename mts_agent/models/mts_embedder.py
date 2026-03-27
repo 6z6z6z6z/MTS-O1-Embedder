@@ -13,6 +13,47 @@ from .projector import TimeSeriesProjector
 from .patch_encoder import TCFormer
 
 
+class LatentAttentionPooling(nn.Module):
+    """NV-Embed style Latent Attention Pooling (Li et al., ICLR 2025 Spotlight).
+
+    K learnable latent queries cross-attend to all token hidden states and produce
+    a single fixed-size embedding by averaging over the K query outputs.
+    Empirically outperforms mean/last-token pooling on retrieval tasks.
+
+    Args:
+        d_model: hidden dimension (= LLM hidden_size)
+        num_latents: number of learnable query vectors (K)
+        n_heads: attention heads in the cross-attention layer
+    """
+    def __init__(self, d_model: int, num_latents: int = 8, n_heads: int = 8) -> None:
+        super().__init__()
+        self.latent_queries = nn.Parameter(torch.randn(num_latents, d_model) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [B, S, d_model]
+            attention_mask: [B, S] with 1 for valid, 0 for padding (optional)
+        Returns:
+            [B, d_model] global representation
+        """
+        B = hidden_states.shape[0]
+        queries = self.latent_queries.unsqueeze(0).expand(B, -1, -1)  # [B, K, d]
+        key_padding_mask = None
+        if attention_mask is not None:
+            key_padding_mask = (attention_mask == 0)  # True = ignore
+        pooled, _ = self.cross_attn(
+            query=queries,
+            key=hidden_states,
+            value=hidden_states,
+            key_padding_mask=key_padding_mask,
+        )
+        pooled = self.norm(pooled)  # [B, K, d]
+        return pooled.mean(dim=1)   # [B, d]
+
+
 class MTSEmbedder(nn.Module):
     def get_text_embeds(self, text_input_ids: torch.Tensor) -> torch.Tensor:
         # Handle simple model or PEFT wrapped model
@@ -328,6 +369,25 @@ class MTSEmbedder(nn.Module):
         )
         return text_input_ids, ts_embeds, inputs_embeds, full_attention_mask, full_labels
 
+    @staticmethod
+    def _make_bidirectional_4d_mask(
+        attention_mask_1d: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Convert 1D padding mask [B, S] to additive 4D bidirectional mask [B, 1, S, S].
+
+        Unlike the model's internal prepare_4d_causal_attention_mask, this version does
+        NOT apply the lower-triangular causal constraint: every non-padding position can
+        attend to every other non-padding position.  Safe only with standard MHA models
+        (Qwen2.5 / LLaMA).  Do NOT use with Qwen3.5 GDR layers.
+        """
+        B, S = attention_mask_1d.shape
+        # key_mask[b, 0, i, j] = 0.0 if position j is valid else -inf
+        key_valid = attention_mask_1d.to(dtype=torch.float32).unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
+        key_valid = key_valid.expand(B, 1, S, S)
+        mask_4d = (1.0 - key_valid) * torch.finfo(dtype).min
+        return mask_4d.to(dtype)
+
     def _project_pooled_embedding(
         self,
         last_hidden_state: torch.Tensor,
@@ -336,8 +396,17 @@ class MTSEmbedder(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         pooling: Optional[str] = None,
     ) -> torch.Tensor:
+        effective_pooling = pooling or self.embedding_pooling
+
+        # Latent Attention Pooling: latent queries cross-attend to ALL hidden states
+        if effective_pooling == "latent" and self.latent_pooler is not None:
+            embedding = self.latent_pooler(last_hidden_state, attention_mask=attention_mask)
+            embedding = self.final_norm(embedding.to(self.final_norm.weight.dtype))
+            embedding = embedding.to(self.final_projection.weight.dtype)
+            return self.final_projection(embedding)
+
         ts_mask = None
-        if (pooling or self.embedding_pooling) == "ts_tokens":
+        if effective_pooling == "ts_tokens":
             ts_mask = self._get_ts_token_mask(
                 text_input_ids,
                 ts_embeds.shape[1],
@@ -393,10 +462,28 @@ class MTSEmbedder(nn.Module):
         # for the all-hidden-states tuple in ForCausalLM).  The inner decoder has
         # LoRA adapters applied in-place and GC enabled, so behaviour is equivalent.
         decoder = self._get_inner_decoder()
+
+        # Bidirectional attention (Phase 2 / NV-Embed): override the model's default
+        # causal mask by passing a pre-computed 4D mask that only masks padding tokens,
+        # letting all non-padding positions attend to each other in both directions.
+        # SAFE ONLY with standard MHA models (Qwen2.5 / LLaMA).  Qwen3.5 GDR layers
+        # use a recurrent kernel that requires causal ordering — keep 1D mask for those.
+        attn_mask_for_decoder = full_attention_mask
+        if self.use_bidirectional_attn and full_attention_mask is not None and full_attention_mask.dim() == 1:
+            attn_mask_for_decoder = self._make_bidirectional_4d_mask(
+                full_attention_mask.unsqueeze(0),
+                dtype=inputs_embeds.dtype,
+            ).squeeze(0)
+        elif self.use_bidirectional_attn and full_attention_mask is not None and full_attention_mask.dim() == 2:
+            attn_mask_for_decoder = self._make_bidirectional_4d_mask(
+                full_attention_mask,
+                dtype=inputs_embeds.dtype,
+            )
+
         with torch.set_grad_enabled(require_grad):
             outputs = decoder(
                 inputs_embeds=inputs_embeds,
-                attention_mask=full_attention_mask,
+                attention_mask=attn_mask_for_decoder,
                 return_dict=True,
             )
 
@@ -435,6 +522,11 @@ class MTSEmbedder(nn.Module):
         tc_former_max_channels: int = 64,
         tc_former_max_patches: int = 256,
         tc_former_use_revin: bool = True,
+        # Phase 2: bidirectional attention (NV-Embed) — use only with MHA models (Qwen2.5)
+        use_bidirectional_attn: bool = False,
+        # Phase 2: latent attention pooling (NV-Embed) — activated when embedding_pooling="latent"
+        latent_pooling_num_latents: int = 8,
+        latent_pooling_heads: int = 8,
     ) -> None:
         super().__init__()
         resolved_stem_strides = list(stem_strides) if stem_strides is not None else [5, 5]
@@ -498,8 +590,22 @@ class MTSEmbedder(nn.Module):
         self.final_projection = nn.Linear(self.llm_dim, self.output_dim)
 
         self.embedding_pooling = embedding_pooling
+        self.use_bidirectional_attn = use_bidirectional_attn
         self.ts_marker_start_id = ts_marker_start_id
         self.ts_marker_end_id = ts_marker_end_id
+
+        # Phase 2: Latent Attention Pooling (activated when embedding_pooling="latent")
+        self.latent_pooler: Optional[LatentAttentionPooling] = None
+        if embedding_pooling == "latent":
+            self.latent_pooler = LatentAttentionPooling(
+                d_model=self.llm_dim,
+                num_latents=latent_pooling_num_latents,
+                n_heads=latent_pooling_heads,
+            )
+            print(f" -> Latent Attention Pooling: {latent_pooling_num_latents} queries, "
+                  f"{latent_pooling_heads} heads")
+        if use_bidirectional_attn:
+            print(" -> Bidirectional attention: enabled (causal mask removed — use only with MHA models)")
 
     def _get_ts_token_mask(self, text_input_ids, ts_seq_len, max_seq_len):
         """Return float mask (B, max_seq_len) with 1.0 at TS token positions.

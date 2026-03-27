@@ -376,6 +376,9 @@ def build_model(config):
         tc_former_max_channels=getattr(config.model, 'tc_former_max_channels', 64),
         tc_former_max_patches=getattr(config.model, 'tc_former_max_patches', 256),
         tc_former_use_revin=getattr(config.model, 'tc_former_use_revin', True),
+        use_bidirectional_attn=getattr(config.model, 'use_bidirectional_attn', False),
+        latent_pooling_num_latents=getattr(config.model, 'latent_pooling_num_latents', 8),
+        latent_pooling_heads=getattr(config.model, 'latent_pooling_heads', 8),
     )
 
 

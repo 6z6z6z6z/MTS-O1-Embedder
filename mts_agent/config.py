@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 ModeType = Literal["gen_data", "train"]
 EncoderNormType = Literal["group", "batch"]
-EmbeddingPoolingType = Literal["mean", "last", "ts_tokens"]
+EmbeddingPoolingType = Literal["mean", "last", "ts_tokens", "latent"]
 TuningStrategyType = Literal["full", "freeze", "partial", "lora"]
 TrainingStageType = Literal["alignment", "reasoning"]
 AlignmentTextModeType = Literal["full", "context", "label", "context_label"]
@@ -98,6 +98,13 @@ class ModelConfig:
     tc_former_max_channels: int = 64   # max channels for learnable channel embedding
     tc_former_max_patches: int = 256   # max patches per channel for position embedding
     tc_former_use_revin: bool = True   # use RevIN normalization (recommended)
+    # Phase 2: Bidirectional attention (NV-Embed style) — safe only with standard MHA models
+    # (NOT for Qwen3.5 GDR hybrid layers which require causal/recurrent attention).
+    use_bidirectional_attn: bool = False
+    # Phase 2: Latent Attention Pooling (NV-Embed style) — replaces ts_tokens mean pooling
+    # when embedding_pooling="latent". K learnable queries cross-attend all hidden states.
+    latent_pooling_num_latents: int = 8   # number of learnable latent queries
+    latent_pooling_heads: int = 8         # attention heads in cross-attention
     # Token IDs for TS-segment markers; Qwen2/3 use 151652/151653 by default.
     # For other model families, set these to the IDs of your chosen delimiter tokens.
     ts_marker_start_id: int = 151652
