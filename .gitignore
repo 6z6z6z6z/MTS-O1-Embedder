@@ -31,4 +31,20 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
-.claude/.claude/
+.claude/
+
+# Raw datasets (too large, download separately)
+UEA_Archive/
+mts_agent/NATOPS/
+
+# Processed data (regenerable, keep only NATOPS core)
+mts_agent/data/processed/*
+!mts_agent/data/processed/natops_train.jsonl
+!mts_agent/data/processed/natops_valid.jsonl
+
+# Root-level data files
+universal_mix_*.jsonl
+
+# PDF files (binary, not diffable)
+*.pdf
+results/*.pdf

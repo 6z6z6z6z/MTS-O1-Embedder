@@ -5,8 +5,7 @@ Optimized with fast DTW approximation and caching.
 """
 import numpy as np
 from scipy.spatial.distance import cdist
-import warnings
-warnings.filterwarnings('ignore')
+
 
 class HybridRetriever:
     def __init__(self, dtw_window_size=None, fast_dtw_max_len=100):
@@ -18,6 +17,27 @@ class HybridRetriever:
         self._vector_matrix = None
         self.dtw_window_size = dtw_window_size
         self.fast_dtw_max_len = int(fast_dtw_max_len)
+        self._warned_dim_mismatch = False
+        self._warned_vec_dim_mismatch = False
+        self._warned_batch_len_mismatch = False
+
+    @staticmethod
+    def _to_numpy(array_like, dtype=np.float32):
+        if isinstance(array_like, np.ndarray):
+            return array_like.astype(dtype, copy=False)
+        return np.asarray(array_like, dtype=dtype)
+
+    def _normalize_embedding(self, embedding):
+        arr = self._to_numpy(embedding)
+        if arr.ndim == 0:
+            raise ValueError("Embedding must have at least one dimension.")
+        return arr.reshape(-1)
+
+    def _normalize_time_series(self, time_series):
+        arr = self._to_numpy(time_series)
+        if arr.ndim == 0:
+            raise ValueError("time_series must have at least one dimension.")
+        return arr
 
     def add(self, item_id, embedding, time_series, label=None):
         """
@@ -26,10 +46,8 @@ class HybridRetriever:
         embedding: numpy array [D]
         time_series: numpy array [T] or [D, T]
         """
-        if isinstance(embedding, list):
-            embedding = np.array(embedding)
-        if isinstance(time_series, list):
-            time_series = np.array(time_series)
+        embedding = self._normalize_embedding(embedding)
+        time_series = self._normalize_time_series(time_series)
             
         self.ids.append(item_id)
         self.labels.append(None if label is None else str(label))
@@ -43,10 +61,11 @@ class HybridRetriever:
         """
         if not self.vectors:
             print("Warning: No vectors to build index.")
+            self._vector_matrix = None
+            self._built = False
             return
-            
-        # Stack and Normalize
-        matrix = np.array(self.vectors)
+
+        matrix = np.stack([self._normalize_embedding(vec) for vec in self.vectors], axis=0)
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         self._vector_matrix = matrix / (norms + 1e-10)
         self._built = True
@@ -69,6 +88,18 @@ class HybridRetriever:
              s1 = s1.T  # [T, C]
         if s2.shape[0] < s2.shape[1]:
              s2 = s2.T  # [T, C]
+
+        # Cross-domain retrieval may compare samples with different channel counts.
+        # Collapse both to single-channel to keep DTW well-defined and robust.
+        if s1.shape[1] != s2.shape[1]:
+            if not self._warned_dim_mismatch:
+                print(
+                    f"Warning: DTW feature dim mismatch ({s1.shape[1]} vs {s2.shape[1]}). "
+                    "Falling back to channel-mean DTW."
+                )
+                self._warned_dim_mismatch = True
+            s1 = s1.mean(axis=1, keepdims=True)
+            s2 = s2.mean(axis=1, keepdims=True)
 
         n, m = s1.shape[0], s2.shape[0]
 
@@ -107,10 +138,10 @@ class HybridRetriever:
         """
         # Downsample if sequences are too long
         max_len = max(1, int(self.fast_dtw_max_len))
-        if len(s1) > max_len or len(s2) > max_len:
+        if s1.shape[0] > max_len or s2.shape[0] > max_len:
             # Simple downsampling
-            stride1 = max(1, len(s1) // max_len)
-            stride2 = max(1, len(s2) // max_len)
+            stride1 = max(1, s1.shape[0] // max_len)
+            stride2 = max(1, s2.shape[0] // max_len)
             s1_ds = s1[::stride1]
             s2_ds = s2[::stride2]
             downsampled_window = self.dtw_window_size
@@ -120,15 +151,41 @@ class HybridRetriever:
         else:
             return self._compute_dtw(s1, s2)
 
-    def search(self, query_vec, query_ts, k=5, alpha=0.7):
+    def _prepare_search_inputs(self, query_vec, query_ts, k, alpha):
+        if not self.ids:
+            return None
+
+        if not self._built:
+            self.build_index()
+        if not self._built or self._vector_matrix is None:
+            return None
+
+        q_vec = self._normalize_embedding(query_vec)
+        if q_vec.shape[0] != self._vector_matrix.shape[1]:
+            if not self._warned_vec_dim_mismatch:
+                print(
+                    f"Warning: query embedding dim mismatch ({q_vec.shape[0]} vs "
+                    f"{self._vector_matrix.shape[1]}). Returning empty result."
+                )
+                self._warned_vec_dim_mismatch = True
+            return None
+
+        q_ts = self._normalize_time_series(query_ts)
+        top_k = max(1, min(int(k), len(self.ids)))
+        blend_alpha = float(np.clip(alpha, 0.0, 1.0))
+        return q_vec, q_ts, top_k, blend_alpha
+
+    def search(self, query_vec, query_ts, k=5, alpha=0.7, include_ts_preview=True):
         """
         Hybrid Search: alpha * Semantic + (1-alpha) * Structural
         query_vec: [D]
         query_ts: [T] or [D, T] matches stored format
         alpha: weight for Semantic Score (0.0 to 1.0)
         """
-        if not self._built:
-            self.build_index()
+        prepared = self._prepare_search_inputs(query_vec, query_ts, k, alpha)
+        if prepared is None:
+            return []
+        query_vec, query_ts, k, alpha = prepared
 
         # 1. Semantic Score (Cosine Similarity)
         # Normalize Query
@@ -181,14 +238,16 @@ class HybridRetriever:
         
         results = []
         for idx in best_of_m:
-            results.append({
+            item = {
                 "id": self.ids[idx],
                 "label": self.labels[idx] if idx < len(self.labels) else None,
                 "score": float(final_scores[idx]),
                 "sem_score": float(sem_scores[idx]),
                 "struct_score": float(struct_scores[idx]),
-                "raw_ts_sample": self.ts_data[idx].flatten()[:10].tolist() # Preview
-            })
+            }
+            if include_ts_preview:
+                item["raw_ts_sample"] = self.ts_data[idx].flatten()[:10].tolist()  # Preview
+            results.append(item)
             
         return results
 
@@ -198,8 +257,16 @@ class HybridRetriever:
         query_vecs: list of numpy arrays [D]
         query_ts_list: list of numpy arrays [T] or [D, T]
         """
+        total = min(len(query_vecs), len(query_ts_list))
+        if len(query_vecs) != len(query_ts_list) and not self._warned_batch_len_mismatch:
+            print(
+                f"Warning: batch_search length mismatch ({len(query_vecs)} vs {len(query_ts_list)}). "
+                f"Using first {total} pairs."
+            )
+            self._warned_batch_len_mismatch = True
+
         results = []
-        for query_vec, query_ts in zip(query_vecs, query_ts_list):
+        for query_vec, query_ts in zip(query_vecs[:total], query_ts_list[:total]):
             result = self.search(query_vec, query_ts, k=k, alpha=alpha)
             results.append(result)
         return results
@@ -215,7 +282,9 @@ class HybridRetriever:
             'vectors': self.vectors,
             'ts_data': self.ts_data,
             '_built': self._built,
-            '_vector_matrix': self._vector_matrix
+            '_vector_matrix': self._vector_matrix,
+            'dtw_window_size': self.dtw_window_size,
+            'fast_dtw_max_len': self.fast_dtw_max_len,
         }
         with open(filepath, 'wb') as f:
             pickle.dump(data, f)
@@ -234,4 +303,6 @@ class HybridRetriever:
         self.ts_data = data['ts_data']
         self._built = data['_built']
         self._vector_matrix = data['_vector_matrix']
+        self.dtw_window_size = data.get('dtw_window_size', self.dtw_window_size)
+        self.fast_dtw_max_len = int(data.get('fast_dtw_max_len', self.fast_dtw_max_len))
         print(f"Index loaded from {filepath} with {len(self.ids)} items")

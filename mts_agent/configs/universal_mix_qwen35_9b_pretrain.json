@@ -1,0 +1,83 @@
+{
+  "experiment_name": "universal_mix_qwen35_9b_pretrain",
+  "mode": "train",
+  "data": {
+    "data_path": "universal_mix_train.jsonl",
+    "raw_data_path": "universal_mix_train.jsonl",
+    "dataset_name": "universal_mix",
+    "batch_size": 8,
+    "ts_dim": 1,
+    "augment": true,
+    "max_length": 512,
+    "domain_info": "Multi-domain universal multivariate time-series mix for self-supervised pretraining."
+  },
+  "model": {
+    "llm_path": "local_model",
+    "ts_input_dim": 1,
+    "ts_hidden_dim": 128,
+    "output_dim": 1024,
+    "encoder_base_channels": 64,
+    "encoder_target_tokens": 16,
+    "encoder_dropout": 0.1,
+    "encoder_norm": "group",
+    "embedding_pooling": "last",
+    "llm_attn_implementation": "eager",
+    "tuning_strategy": "lora",
+    "num_trainable_layers": 2,
+    "stem_strides": [5, 5],
+    "patch_size": 5
+  },
+  "training": {
+    "seed": 42,
+    "epochs": 15,
+    "lr": 5e-5,
+    "contrastive_temperature": 0.1,
+    "alignment_text_mode": "context",
+    "contrastive_positive_mode": "diagonal",
+    "gradient_accumulation_steps": 16,
+    "balanced_sampling": false,
+    "allow_repeated_classes_in_batch": true,
+    "early_stopping_patience": 6,
+    "early_stopping_min_delta": 0.001,
+    "training_stage": "alignment",
+    "contrastive_weight": 1.0,
+    "lm_weight": 0.0,
+    "cls_weight": 0.0,
+    "ts_only_embedding": false,
+    "retrieval_eval_enabled": false,
+    "use_amp": true,
+    "amp_dtype": "fp16",
+    "save_dir": "checkpoints_universal_mix_qwen35_9b_pretrain",
+    "memory_bank_size": 256,
+    "auto_two_stage": false
+  },
+  "retrieval": {
+    "k": 5,
+    "alpha": 0.9,
+    "dtw_window_size": null,
+    "fast_dtw_max_len": 100
+  },
+  "inference": {
+    "max_new_tokens": 200,
+    "temperature": 0.7,
+    "do_sample": false,
+    "use_api": false,
+    "api_key": null
+  },
+  "environment": {
+    "disable_ssl_verify": false,
+    "force_offline": true,
+    "use_dummy_tokenizer": false,
+    "device": "cuda"
+  },
+  "arm": {
+    "enabled": false,
+    "k": 5,
+    "epochs": 100,
+    "lr": 0.0003,
+    "num_heads": 8,
+    "dropout": 0.1,
+    "augment_gallery": false,
+    "augment_factor": 5
+  }
+}

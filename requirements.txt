@@ -1,7 +1,79 @@
-torch>=2.0.0
-transformers>=4.40.0
-peft>=0.10.0
-numpy>=1.24.0
-scipy>=1.10.0
-tqdm>=4.65.0
-requests>=2.28.0
+# ============================================================
+# MTS-O1-Embedder — Virtual Environment Requirements
+# Python 3.14  |  CUDA 13.2  |  RTX 4090
+# 更新时间: 2026-03-21
+# ============================================================
+#
+# !! 严格按以下顺序手动执行，不要直接 pip install -r !!
+#
+# ── Step 1: PyTorch 2.7.1 ─────────────────────────────────────
+# CUDA 13.2 runtime 向下兼容 cu128/cu130 wheel
+# 可选 cu128（PyTorch 2.7.1 官方）或 cu130（ABI 兼容）
+#
+#   pip install torch==2.7.1 torchvision torchaudio \
+#       --index-url https://download.pytorch.org/whl/cu128
+#
+# 注：PyTorch 2.10.0 也可能工作，但 Triton 3.3.1 + PyTorch 2.7.1
+#     是经过 Qwen3.5 部署指南验证的组合，推荐用 2.7.1。
+#
+# ── Step 2: Triton 3.3.1 ──────────────────────────────────────
+# 重点！Triton 版本不对 FLA 会疯狂报错（OOB access、illegal memory）
+# Triton 3.1.0 有 OOB bug；3.3.1 是推荐版本
+#
+#   pip uninstall triton pytorch-triton triton-nightly -y
+#   pip install triton==3.3.1
+#
+# ── Step 3: flash-linear-attention 0.4.2 ─────────────────────
+# Qwen3.5 GDR 层必须；0.4.2 是与 Triton 3.3.1 对应的稳定版本
+# 必须从源码安装（--no-deps 避免覆盖已装版本）
+#
+#   pip uninstall flash-linear-attention -y
+#   pip install einops ninja
+#   pip install --no-use-pep517 --no-deps \
+#       git+https://github.com/fla-org/flash-linear-attention@v0.4.2
+#
+# ── Step 4: 本文件其余依赖 ────────────────────────────────────
+#
+#   pip install -r requirements.txt
+#
+# ── 验证 ──────────────────────────────────────────────────────
+#   python -c "import triton; print(triton.__version__)"   # 3.3.1
+#   python -c "import fla; print(fla.__version__)"          # 0.4.2
+#
+# ============================================================
+
+# ── PyTorch（Step 1 已装，此处仅声明最低版本供检查）───────────
+torch>=2.7.0
+
+# ── 核心 ML 框架 ─────────────────────────────────────────────
+# transformers — 必须从 GitHub main 安装（PR #43830 修复 Qwen3.5 text-only loading）
+# pip install git+https://github.com/huggingface/transformers.git
+transformers>=5.3.0
+
+# peft 0.18.1+: transformers 5.x 要求；旧版 peft 与 transformers 5 不兼容
+peft>=0.18.1
+
+# accelerate: AMP bf16/fp16 混合精度训练必须
+accelerate>=1.12.0
+
+# ── Tokenizer 依赖 ────────────────────────────────────────────
+# Qwen 全系列使用 tiktoken BPE（缺少会退回 DummyTokenizer 导致训练异常）
+tiktoken>=0.7.0
+sentencepiece>=0.1.99
+protobuf>=5.0.0
+
+# ── fla 运行依赖（Step 3 中 --no-deps 跳过了，须手动补充）──────
+einops
+ninja
+
+# ── causal-conv1d（FLA fast path 必需，缺少则 FLA 退回 torch 实现并打印 "Falling back"）
+causal-conv1d==1.6.1
+
+# ── 数据处理 / 评估 ──────────────────────────────────────────
+numpy>=2.0.0
+scipy>=1.14.0
+scikit-learn>=1.5.0
+
+# ── 工具库 ───────────────────────────────────────────────────
+tqdm>=4.67.0
+requests>=2.32.0

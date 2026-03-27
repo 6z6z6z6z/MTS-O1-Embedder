@@ -12,7 +12,7 @@
     "domain_info": "Generic multivariate time-series dataset with variable length sensor observations."
   },
   "model": {
-    "llm_path": "local_model",
+    "llm_path": "Qwen/Qwen3-8B",
     "ts_input_dim": null,
     "ts_hidden_dim": 128,
     "encoder_base_channels": 64,
@@ -31,8 +31,6 @@
     "early_stopping_min_delta": 0.0,
     "training_stage": "alignment",
     "contrastive_weight": 0.7,
-    "neighbor_weight": 0.0,
-    "neighbor_margin": 0.1,
     "lm_weight": 0.3,
     "save_dir": "checkpoints_generic",
     "ckpt_path": null

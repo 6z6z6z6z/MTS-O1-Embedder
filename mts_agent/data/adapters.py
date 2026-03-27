@@ -5,9 +5,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import warnings
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
+
+
+DATA_ARRAY_KEYS = ("X", "data", "samples", "time_series")
+LABEL_ARRAY_KEYS = ("y", "label", "labels", "target", "targets")
 
 
 def ensure_channel_first(ts_data):
@@ -33,6 +39,33 @@ def infer_dataset_name(dataset_path, dataset_name=None):
     return stem or "General_TS"
 
 
+def _extract_first_available(mapping, candidate_keys, value_name, source_name):
+    for key in candidate_keys:
+        if key in mapping:
+            return mapping[key]
+    if value_name == "time-series array":
+        raise ValueError(f"Could not find {value_name} in {source_name}. Keys: {sorted(mapping.keys())}")
+    return None
+
+
+def _dataset_match_tokens(dataset_path: str, dataset_name: Optional[str]) -> set[str]:
+    candidates = [dataset_name or ""]
+    normalized_path = os.path.normpath(dataset_path)
+    base_name = os.path.basename(normalized_path)
+    stem, _ = os.path.splitext(base_name)
+    parent_name = os.path.basename(os.path.dirname(normalized_path))
+    candidates.extend([normalized_path, base_name, stem, parent_name])
+
+    tokens = set()
+    for value in candidates:
+        if not value:
+            continue
+        lowered = value.lower()
+        tokens.add(lowered)
+        tokens.update(token for token in re.split(r"[^a-z0-9]+", lowered) if token)
+    return tokens
+
+
 def load_npy_or_npz(file_path):
     loaded = np.load(file_path, allow_pickle=True)
 
@@ -40,20 +73,17 @@ def load_npy_or_npz(file_path):
         return loaded, None
 
     if hasattr(loaded, "files"):
-        keys = set(loaded.files)
-        data_key = next((k for k in ["X", "data", "samples", "time_series"] if k in keys), None)
-        label_key = next((k for k in ["y", "label", "labels", "target", "targets"] if k in keys), None)
-        if data_key is None:
-            raise ValueError(f"Could not find time-series array in {file_path}. Keys: {sorted(keys)}")
-        data = loaded[data_key]
-        labels = loaded[label_key] if label_key else None
-        return data, labels
+        try:
+            keys = set(loaded.files)
+            data = _extract_first_available(loaded, DATA_ARRAY_KEYS, "time-series array", file_path)
+            labels = _extract_first_available(loaded, LABEL_ARRAY_KEYS, "label array", file_path)
+            return data, labels
+        finally:
+            loaded.close()
 
     if isinstance(loaded, dict):
-        data = loaded.get("X") or loaded.get("data") or loaded.get("samples") or loaded.get("time_series")
-        labels = loaded.get("y") or loaded.get("label") or loaded.get("labels") or loaded.get("target")
-        if data is None:
-            raise ValueError(f"Could not find time-series array in {file_path}")
+        data = _extract_first_available(loaded, DATA_ARRAY_KEYS, "time-series array", file_path)
+        labels = _extract_first_available(loaded, LABEL_ARRAY_KEYS, "label array", file_path)
         return data, labels
 
     raise ValueError(f"Unsupported file format: {file_path}")
@@ -72,6 +102,8 @@ def load_folder_dataset(folder_path, mode='train'):
         if os.path.exists(x_path):
             data = np.load(x_path, mmap_mode='r')
             labels = np.load(y_path, allow_pickle=True) if os.path.exists(y_path) else None
+            if labels is None and mode in {'train', 'valid', 'test'}:
+                warnings.warn(f"Labels file is missing for split '{mode}' in {folder_path}: expected {y_name}")
             return data, labels
 
     npy_files = [f for f in os.listdir(folder_path) if f.endswith('.npy') or f.endswith('.npz')]
@@ -102,7 +134,10 @@ DATASET_ADAPTERS: Dict[str, AdapterFn] = {
 
 def register_dataset_adapter(key: str, adapter: AdapterFn):
     """Register or override a dataset adapter by key."""
-    DATASET_ADAPTERS[key.lower()] = adapter
+    normalized_key = key.strip().lower()
+    if not normalized_key:
+        raise ValueError("Adapter key must be a non-empty string")
+    DATASET_ADAPTERS[normalized_key] = adapter
 
 
 def dataset_adapter(key: str):
@@ -114,9 +149,9 @@ def dataset_adapter(key: str):
 
 
 def resolve_dataset_adapter(dataset_path: str, dataset_name: Optional[str] = None) -> AdapterFn:
-    lowered = f"{dataset_name or ''} {dataset_path}".lower()
+    tokens = _dataset_match_tokens(dataset_path, dataset_name)
     for key, adapter in DATASET_ADAPTERS.items():
-        if key in lowered:
+        if key.lower() in tokens:
             return adapter
     return _generic_adapter
 
@@ -135,27 +170,38 @@ def infer_ts_input_dim_from_jsonl(data_path: str) -> Optional[int]:
     if not os.path.exists(data_path):
         return None
     with open(data_path, 'r', encoding='utf-8') as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             if not line.strip():
                 continue
-            item = json.loads(line)
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON on line {line_no} in {data_path}") from exc
+            if not isinstance(item, dict):
+                raise ValueError(f"Expected JSON object on line {line_no} in {data_path}, got {type(item).__name__}")
             if 'time_series' in item:
-                return infer_ts_input_dim_from_array(item['time_series'])
+                try:
+                    return infer_ts_input_dim_from_array(item['time_series'])
+                except Exception as exc:
+                    raise ValueError(f"Invalid time_series on line {line_no} in {data_path}") from exc
     return None
 
 
 def infer_ts_input_dim(data_path: Optional[str] = None, raw_data_path: Optional[str] = None, dataset_name: Optional[str] = None) -> Optional[int]:
     if data_path:
-        dim = infer_ts_input_dim_from_jsonl(data_path)
-        if dim is not None:
-            return dim
+        try:
+            dim = infer_ts_input_dim_from_jsonl(data_path)
+            if dim is not None:
+                return dim
+        except (OSError, ValueError) as exc:
+            warnings.warn(f"Failed to infer ts_dim from processed data {data_path}: {exc}")
 
     if raw_data_path and os.path.exists(raw_data_path):
         try:
             data, _ = load_dataset_by_adapter(raw_data_path, mode='train', dataset_name=dataset_name)
             if len(data) > 0:
                 return infer_ts_input_dim_from_array(data[0])
-        except Exception:
-            return None
+        except (OSError, ValueError, IndexError, KeyError) as exc:
+            warnings.warn(f"Failed to infer ts_dim from raw data {raw_data_path}: {exc}")
 
     return None

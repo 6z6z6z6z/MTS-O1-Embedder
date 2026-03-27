@@ -126,27 +126,3 @@ def build_fallback_reasoning(features: dict, dataset_name: str, label: str) -> s
     _, reasoning_builder = TEMPLATE_REGISTRY[key]
     return reasoning_builder(features, label)
 
-
-def build_llm_prompts(features: dict, dataset_name: str, label: str) -> Tuple[str, str, str]:
-    """Build (context, system_prompt, user_prompt) for teacher-thought generation."""
-    context = get_context_template(dataset_name)
-    system_prompt = (
-        "You are an expert time-series analyst. "
-        "Your task is to analyze a time-series sample and provide a concise chain-of-thought style rationale. "
-        "You must conclude the classification label clearly."
-    )
-    user_prompt = (
-        f"Domain: {dataset_name}\n"
-        f"Context: {context}\n"
-        f"Raw Data Table (Downsampled):\n"
-        f"{features['table_text']}\n\n"
-        f"Hypothesis: The signal matches class '{label}'.\n\n"
-        "Task: Confirm this hypothesis by analyzing the raw data table directly.\n"
-        "1.  **Scan the Table**: Look at channel-wise values across time.\n"
-        "2.  **Find the Pattern**: Identify channels or segments that show distinct behaviour supporting the label.\n"
-        "3.  **Explain**: Connect those specific values to the conclusion.\n"
-        "CRITICAL: Do NOT mention you were given the label.\n"
-        "Output format:\nThinking Process: ...\nConclusion: {label}"
-    )
-    return context, system_prompt, user_prompt
-

@@ -1,11 +1,13 @@
-import torch
 """
 Evaluation script for hybrid retrieval system.
 Tests retrieval accuracy using k-NN classification.
 """
-import os
 import argparse
 import json
+import os
+
+import numpy as np
+import torch
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score
 
@@ -31,6 +33,51 @@ def _normalize_score_dict(score_dict):
     if max_score <= min_score:
         return {key: 1.0 for key in score_dict}
     return {key: (value - min_score) / (max_score - min_score) for key, value in score_dict.items()}
+
+
+def _clamp_alpha(alpha):
+    return float(np.clip(float(alpha), 0.0, 1.0))
+
+
+def _safe_k(k):
+    return max(1, int(k))
+
+
+def _aligned_length_with_warning(name, *seqs):
+    lengths = [len(seq) for seq in seqs]
+    if not lengths:
+        return 0
+    min_len = min(lengths)
+    max_len = max(lengths)
+    if min_len != max_len:
+        print(f"Warning: {name} length mismatch {lengths}. Using first {min_len} samples.")
+    return min_len
+
+
+def _load_checkpoint_filtered(model, ckpt_path, device):
+    """Load checkpoint weights with shape filtering for compatibility."""
+    if not ckpt_path:
+        return
+    if not os.path.exists(ckpt_path):
+        print(f"Warning: checkpoint not found: {ckpt_path}")
+        return
+
+    print(f"Loading checkpoint from {ckpt_path}")
+    state_dict = torch.load(ckpt_path, map_location=device)
+    model_state = model.state_dict()
+    filtered_state_dict = {}
+    for key, value in state_dict.items():
+        if key in model_state and hasattr(value, "shape") and hasattr(model_state[key], "shape"):
+            if value.shape == model_state[key].shape:
+                filtered_state_dict[key] = value
+            else:
+                print(f"Skipping layer {key} due to shape mismatch: {value.shape} vs {model_state[key].shape}")
+        elif key in model_state:
+            filtered_state_dict[key] = value
+        else:
+            print(f"Skipping unknown layer {key}")
+
+    model.load_state_dict(filtered_state_dict, strict=False)
 
 
 def build_class_prototypes(embeddings, labels):
@@ -111,21 +158,27 @@ def aggregate_with_prototypes(neighbor_scores, prototype_scores, prototype_weigh
     pred_label = max(fused_scores.items(), key=lambda x: (x[1], x[0]))[0]
     return pred_label, fused_scores
 
-def build_retrieval_cache(model, dataset, collator, device, dtw_window_size=None, fast_dtw_max_len=100, use_full_prompt=True, ts_only_embedding=False):
-    """Extract embeddings once and build the retrieval index cache.
 
-    Args:
-        use_full_prompt: If True, use context+thought prompts when available.
-            If False, always use context-only prompts.
-        ts_only_embedding: If True, bypass the LLM and embed using only the
-            TS encoder + projector. Eliminates text-identity bias.
+def _extract_embeddings_for_dataset(
+    model,
+    dataset,
+    collator,
+    device,
+    *,
+    use_full_prompt,
+    ts_only_embedding,
+    truncation,
+):
+    """Encode a dataset into retrieval embeddings plus aligned labels/series.
+
+    truncation=False keeps legacy behavior for cache/LOO mode.
+    truncation=True keeps gallery-building behavior for cross-set evaluation.
     """
-    print("Building retrieval index...")
-    retriever = HybridRetriever(dtw_window_size=dtw_window_size, fast_dtw_max_len=fast_dtw_max_len)
+    if len(dataset) == 0:
+        print("Warning: dataset is empty, no embeddings extracted.")
+        return [], [], []
 
-    embeddings = []
-    labels = []
-    ts_data_list = []
+    embeddings, labels, ts_data_list = [], [], []
 
     print("Extracting embeddings for index...")
     for i in tqdm(range(len(dataset))):
@@ -142,7 +195,12 @@ def build_retrieval_cache(model, dataset, collator, device, dtw_window_size=None
                     prompt = build_full_prompt(context, thought=thought, include_response_stub=False)
                 else:
                     prompt = build_retrieval_prompt(context)
-                inputs = collator.tokenizer(prompt, return_tensors="pt")
+
+                tokenizer_kwargs = {'return_tensors': 'pt'}
+                if truncation:
+                    tokenizer_kwargs.update({'truncation': True, 'max_length': collator.max_length})
+
+                inputs = collator.tokenizer(prompt, **tokenizer_kwargs)
                 text_input_ids = inputs.input_ids.to(device)
                 attention_mask = inputs.attention_mask.to(device) if hasattr(inputs, 'attention_mask') else None
                 embedding = model.get_embedding(ts_input, text_input_ids, attention_mask=attention_mask)
@@ -152,9 +210,33 @@ def build_retrieval_cache(model, dataset, collator, device, dtw_window_size=None
         labels.append(item['label'])
         ts_data_list.append(item['time_series'].cpu().numpy())
 
+    return embeddings, labels, ts_data_list
+
+def build_retrieval_cache(model, dataset, collator, device, dtw_window_size=None, fast_dtw_max_len=100, use_full_prompt=True, ts_only_embedding=False):
+    """Extract embeddings once and build the retrieval index cache.
+
+    Args:
+        use_full_prompt: If True, use context+thought prompts when available.
+            If False, always use context-only prompts.
+        ts_only_embedding: If True, bypass the LLM and embed using only the
+            TS encoder + projector. Eliminates text-identity bias.
+    """
+    print("Building retrieval index...")
+    retriever = HybridRetriever(dtw_window_size=dtw_window_size, fast_dtw_max_len=fast_dtw_max_len)
+    embeddings, labels, ts_data_list = _extract_embeddings_for_dataset(
+        model,
+        dataset,
+        collator,
+        device,
+        use_full_prompt=use_full_prompt,
+        ts_only_embedding=ts_only_embedding,
+        truncation=False,
+    )
+
     for i, (emb, ts, label) in enumerate(zip(embeddings, ts_data_list, labels)):
         retriever.add(f"sample_{i}_{label}", emb, ts, label=label)
-    retriever.build_index()
+    if embeddings:
+        retriever.build_index()
 
     print(f"Index built with {len(embeddings)} samples")
     return retriever, embeddings, labels, ts_data_list
@@ -170,179 +252,32 @@ def build_gallery(model, dataset, collator, device, dtw_window_size=None, fast_d
             TS encoder + projector. Eliminates text-identity bias.
     """
     retriever = HybridRetriever(dtw_window_size=dtw_window_size, fast_dtw_max_len=fast_dtw_max_len)
-    embeddings, labels, ts_data_list = [], [], []
-
-    print("Extracting embeddings for index...")
-    for i in tqdm(range(len(dataset))):
-        item = dataset[i]
-        ts_input = item['time_series'].unsqueeze(0).to(device).float()
-
-        with torch.no_grad():
-            if ts_only_embedding:
-                emb = model.get_ts_only_embedding(ts_input)
-            else:
-                thought = item.get('teacher_thought')
-                if use_full_prompt and thought:
-                    prompt = build_full_prompt(item['context'], thought=thought, include_response_stub=False)
-                else:
-                    prompt = build_retrieval_prompt(item['context'])
-                inputs = collator.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=collator.max_length)
-                text_input_ids = inputs.input_ids.to(device)
-                attention_mask = inputs.attention_mask.to(device)
-                emb = model.get_embedding(ts_input, text_input_ids, attention_mask=attention_mask)
-            emb = emb.cpu().numpy().flatten()
-
-        embeddings.append(emb)
-        labels.append(item['label'])
-        ts_data_list.append(item['time_series'].cpu().numpy())
+    embeddings, labels, ts_data_list = _extract_embeddings_for_dataset(
+        model,
+        dataset,
+        collator,
+        device,
+        use_full_prompt=use_full_prompt,
+        ts_only_embedding=ts_only_embedding,
+        truncation=True,
+    )
 
     for i, (emb, ts, label) in enumerate(zip(embeddings, ts_data_list, labels)):
         retriever.add(f"train_{i}_{label}", emb, ts, label=label)
-    retriever.build_index()
+    if embeddings:
+        retriever.build_index()
     print(f"Index built with {len(embeddings)} samples")
     return retriever, embeddings, labels, ts_data_list
 
 
-def build_augmented_gallery(
-    model,
-    dataset,
-    collator,
-    device,
-    num_augments: int = 5,
-    dtw_window_size=None,
-    fast_dtw_max_len: int = 100,
-):
-    """Build a richly-populated gallery by embedding augmented versions of each
-    training sample.
-
-    For each sample we produce 1 original + num_augments augmented embeddings,
-    all sharing the same class label.  This densifies the retrieval space and
-    is particularly important for small datasets with limited training samples.
-
-    The text prompt is shared across augmentations (context-only); only the
-    time-series input varies.
-
-    Returns
-    -------
-    retriever, embeddings (list[ndarray H]), labels (list[str]), ts_data_list
-    """
-    from mts_agent.data.augmentations import TimeSeriesAugmentor
-    from mts_agent.data.prompt_builder import build_retrieval_prompt
-
-    # prob=1.0 so every call produces a different augmentation
-    augmentor = TimeSeriesAugmentor(prob=1.0, sigma=0.03, scale_sigma=0.1)
-
-    retriever = HybridRetriever(
-        dtw_window_size=dtw_window_size, fast_dtw_max_len=fast_dtw_max_len
-    )
-    embeddings, labels, ts_data_list = [], [], []
-
-    print(f"Building augmented gallery (1 original + {num_augments} augments per sample)...")
-    for i in tqdm(range(len(dataset))):
-        item = dataset[i]
-        ts_original = item["time_series"]   # [D, T] tensor
-        label = item["label"]
-
-        prompt = build_retrieval_prompt(item["context"])
-        inputs = collator.tokenizer(
-            prompt, return_tensors="pt",
-            truncation=True, max_length=collator.max_length,
-        )
-        text_input_ids  = inputs.input_ids.to(device)
-        attention_mask  = inputs.attention_mask.to(device)
-
-        for aug_idx in range(num_augments + 1):
-            ts = ts_original if aug_idx == 0 else augmentor(ts_original)
-            ts_input = ts.unsqueeze(0).to(device).float()
-
-            with torch.no_grad():
-                emb = model.get_embedding(ts_input, text_input_ids, attention_mask=attention_mask)
-                emb = emb.cpu().numpy().flatten()
-
-            ts_np = ts.cpu().numpy() if hasattr(ts, "cpu") else np.asarray(ts)
-            embeddings.append(emb)
-            labels.append(label)
-            ts_data_list.append(ts_np)
-
-    for idx, (emb, ts, lbl) in enumerate(zip(embeddings, ts_data_list, labels)):
-        retriever.add(f"aug_{idx}_{lbl}", emb, ts, label=lbl)
-    retriever.build_index()
-    print(
-        f"Augmented gallery ready: {len(embeddings)} entries "
-        f"({len(dataset)} originals × {num_augments + 1})"
-    )
-    return retriever, embeddings, labels, ts_data_list
-
-
-def embed_queries_with_thought_generation(
-    model, dataset, collator, device,
-    max_new_tokens=200, temperature=0.7, do_sample=False
-):
-    """O1-Embedder inference pipeline: generate thought for each query, then embed with thought.
-
-    Gallery (training set) uses context-only embeddings.
-    Query (test set) uses thought-enriched embeddings generated at inference time.
-    This is the core O1-Embedder design: think first, then retrieve.
-    """
-    from mts_agent.data.prompt_builder import build_full_prompt
-
-    embeddings, labels, ts_data_list = [], [], []
-
-    for i in tqdm(range(len(dataset))):
-        item = dataset[i]
-        ts_input = item['time_series'].unsqueeze(0).to(device).float()
-        context = item['context']
-
-        # Step 1: Build generation prompt ending with "Response:" to elicit thought
-        gen_prompt = build_full_prompt(context, thought=None, include_response_stub=True)
-        gen_inputs = collator.tokenizer(
-            gen_prompt, return_tensors="pt",
-            truncation=True, max_length=collator.max_length
-        )
-        gen_ids = gen_inputs.input_ids.to(device)
-
-        # Step 2: Generate thought (model forward is already no_grad inside generate)
-        generated_thought = ""
-        try:
-            with torch.no_grad():
-                thought_ids = model.generate(
-                    ts_input, gen_ids,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                )
-            generated_thought = collator.tokenizer.decode(thought_ids[0], skip_special_tokens=True).strip()
-        except Exception as e:
-            print(f"[Warning] Thought generation failed for sample {i}: {e}")
-
-        # Step 3: Build embedding prompt with generated thought (fallback: context-only)
-        emb_prompt = build_full_prompt(context, thought=generated_thought, include_response_stub=False)
-        emb_inputs = collator.tokenizer(
-            emb_prompt, return_tensors="pt",
-            truncation=True, max_length=collator.max_length
-        )
-        emb_ids = emb_inputs.input_ids.to(device)
-        emb_mask = emb_inputs.attention_mask.to(device)
-
-        # Step 4: Embed with thought
-        with torch.no_grad():
-            emb = model.get_embedding(ts_input, emb_ids, attention_mask=emb_mask)
-            emb = emb.cpu().numpy().flatten()
-
-        embeddings.append(emb)
-        labels.append(item['label'])
-        ts_data_list.append(item['time_series'].cpu().numpy())
-
-    return embeddings, labels, ts_data_list
-
-
-def embed_queries(model, dataset, collator, device, ts_only_embedding=False):
+def embed_queries(model, dataset, collator, device, ts_only_embedding=False, use_full_prompt=True):
     """Embed query samples.
 
-    Uses thought-enriched prompts (context + teacher_thought) when a thought is
-    available in the sample, matching the training-time query representation.
-    Falls back to context-only if no thought is stored (e.g. raw inference).
-    Gallery samples are always encoded with context-only prompts (see build_gallery).
+    Args:
+        use_full_prompt: When True (default), uses thought-enriched prompts for
+            queries matching the asymmetric O1-Embedder training distribution.
+            When False, uses context-only prompts — use this when training with
+            ``alignment_text_mode != "full"`` to keep eval format consistent.
     """
     embeddings, labels, ts_data_list = [], [], []
 
@@ -354,12 +289,12 @@ def embed_queries(model, dataset, collator, device, ts_only_embedding=False):
             if ts_only_embedding:
                 emb = model.get_ts_only_embedding(ts_input)
             else:
-                # Asymmetric O1-Embedder inference: use thought-enriched prompt for
-                # queries (matching training-time query representation), context-only
-                # for gallery (see build_gallery with use_full_prompt=False).
-                thought = str(item.get('teacher_thought') or item.get('thought') or '').strip()
-                if thought:
-                    prompt = build_full_prompt(item['context'], thought=thought, include_response_stub=False)
+                if use_full_prompt:
+                    thought = str(item.get('teacher_thought') or item.get('thought') or '').strip()
+                    if thought:
+                        prompt = build_full_prompt(item['context'], thought=thought, include_response_stub=False)
+                    else:
+                        prompt = build_retrieval_prompt(item['context'])
                 else:
                     prompt = build_retrieval_prompt(item['context'])
                 inputs = collator.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=collator.max_length)
@@ -389,9 +324,20 @@ def evaluate_gallery_vs_queries(
     No self-exclusion is needed since query samples are not in the gallery.
     """
     print("Evaluating retrieval accuracy...")
+    total = _aligned_length_with_warning(
+        "gallery-vs-query evaluation",
+        query_embeddings,
+        query_labels,
+        query_ts_list,
+    )
+    if total == 0:
+        return {"accuracy": 0.0, "macro_f1": 0.0, "predictions": [], "references": []}
+
+    k = _safe_k(k)
+    alpha = _clamp_alpha(alpha)
     predictions, references = [], []
 
-    for i in tqdm(range(len(query_labels))):
+    for i in tqdm(range(total)):
         query_emb = query_embeddings[i]
         query_ts = query_ts_list[i]
         true_label = query_labels[i]
@@ -427,11 +373,27 @@ def evaluate_retrieval_from_cache(
 ):
     """Evaluate retrieval performance from cached embeddings and index."""
     print("Evaluating retrieval accuracy...")
+    total = _aligned_length_with_warning(
+        "cache evaluation",
+        embeddings,
+        labels,
+        ts_data_list,
+    )
+    if total == 0:
+        return {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "predictions": [],
+            "references": [],
+        }
+
+    k = _safe_k(k)
+    alpha = _clamp_alpha(alpha)
     predictions = []
     references = []
-    prototype_sums, prototype_counts = build_class_prototypes(embeddings, labels)
+    prototype_sums, prototype_counts = build_class_prototypes(embeddings[:total], labels[:total])
 
-    for i in tqdm(range(len(labels))):
+    for i in tqdm(range(total)):
         query_emb = embeddings[i]
         query_ts = ts_data_list[i]
         true_label = labels[i]
@@ -493,7 +455,10 @@ def parse_alpha_grid(alpha, alpha_grid):
         for value in alpha_grid.split(','):
             value = value.strip()
             if value:
-                values.append(float(value))
+                try:
+                    values.append(float(value))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid alpha value in --alpha_grid: {value}") from exc
         if values:
             return values
     return [alpha]
@@ -520,6 +485,7 @@ def main():
     parser.add_argument("--prototype_weight", type=float, default=0.5, help="Fusion weight for prototype-assisted voting")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
     parser.add_argument("--lora", action="store_true", help="Use lora for loading")
+    parser.add_argument("--ts_only_embedding", action="store_true", help="Use TS-only embeddings (bypass LLM) for gallery/query encoding")
     parser.add_argument(
         "--gallery_path", type=str, default=None,
         help="If set, use this dataset as the gallery (train set) and --data_path as queries (test set). "
@@ -528,15 +494,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Import torch here to avoid issues
-    import torch
-
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.llm_path, trust_remote_code=True)
+    # Load tokenizer (offline-first)
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_path, trust_remote_code=True, local_files_only=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -551,10 +514,8 @@ def main():
     # Load model
     model = MTSEmbedder(
         args.llm_path,
-        ts_input_dim=resolved_ts_dim,
         ts_hidden_dim=128,
         encoder_base_channels=args.ts_base_channels,
-        encoder_target_tokens=args.ts_tokens,
         encoder_dropout=args.ts_dropout,
         encoder_norm=args.ts_norm,
         embedding_pooling=args.embedding_pooling
@@ -565,10 +526,7 @@ def main():
         print("Applying PEFT LoRA before loading weights...")
         model.apply_lora(r=8, lora_alpha=16, lora_dropout=0.05)
 
-    if args.ckpt_path and os.path.exists(args.ckpt_path):
-        print(f"Loading checkpoint from {args.ckpt_path}")
-        state_dict = torch.load(args.ckpt_path, map_location=device)
-        model.load_state_dict(state_dict, strict=False)
+    _load_checkpoint_filtered(model, args.ckpt_path, device)
 
     model.to(device)
     model.eval()
@@ -586,10 +544,12 @@ def main():
             model, gallery_dataset, collator, device,
             dtw_window_size=args.dtw_window_size,
             fast_dtw_max_len=args.fast_dtw_max_len,
-            use_full_prompt=False
+            use_full_prompt=False,
+            ts_only_embedding=args.ts_only_embedding
         )
         query_embeddings, query_labels, query_ts_list = embed_queries(
-            model, query_dataset, collator, device
+            model, query_dataset, collator, device,
+            ts_only_embedding=args.ts_only_embedding
         )
 
         results = []
@@ -631,7 +591,8 @@ def main():
         collator,
         device,
         dtw_window_size=args.dtw_window_size,
-        fast_dtw_max_len=args.fast_dtw_max_len
+        fast_dtw_max_len=args.fast_dtw_max_len,
+        ts_only_embedding=args.ts_only_embedding
     )
 
     results = []

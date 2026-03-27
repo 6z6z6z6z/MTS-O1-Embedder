@@ -12,7 +12,7 @@
     "domain_info": "Short description of the new dataset domain."
   },
   "model": {
-    "llm_path": "local_model",
+    "llm_path": "Qwen/Qwen3-8B",
     "ts_input_dim": null,
     "ts_hidden_dim": 128,
     "encoder_base_channels": 64,
