@@ -273,19 +273,6 @@ MTS-O1-Embedder/
 
 ---
 
-## Documentation
-
-Technical documentation (Chinese) is available in the `docs/` directory:
-
-- `架构改进计划.md` — Architecture improvement plan (P1–P8)
-- `技术框架图.md` — Detailed architecture diagrams
-- `系统缺陷分析与改进方向.md` — System deficiency analysis
-- `项目进展与思路整理.md` — Progress summary
-- `时序检索基础模型思考` — Vision for TS retrieval foundation model
-- `时序检索基础模型重构方案.md` — Refactoring plan
-
----
-
 ## License
 
 MIT
