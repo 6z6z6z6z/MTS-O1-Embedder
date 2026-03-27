@@ -10,6 +10,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM
 from .ts_encoder import TimeSeriesEncoder, PatchTokenizer, ChannelMixer
 from .projector import TimeSeriesProjector
+from .patch_encoder import TCFormer
 
 
 class MTSEmbedder(nn.Module):
@@ -427,6 +428,13 @@ class MTSEmbedder(nn.Module):
         projector_hidden_dim: Optional[int] = None,
         channel_mixer: bool = False,
         channel_mixer_heads: int = 4,
+        # TC-Former specific parameters
+        tc_former_layers: int = 4,
+        tc_former_heads: int = 4,
+        tc_former_ff_dim: int = 512,
+        tc_former_max_channels: int = 64,
+        tc_former_max_patches: int = 256,
+        tc_former_use_revin: bool = True,
     ) -> None:
         super().__init__()
         resolved_stem_strides = list(stem_strides) if stem_strides is not None else [5, 5]
@@ -435,7 +443,23 @@ class MTSEmbedder(nn.Module):
 
         self.llm_dim = self.llm.config.hidden_size
 
-        if encoder_type == "patch":
+        if encoder_type == "tc_former":
+            self.ts_encoder = TCFormer(
+                d_model=ts_hidden_dim,
+                n_layers=tc_former_layers,
+                n_heads=tc_former_heads,
+                d_ff=tc_former_ff_dim,
+                dropout=encoder_dropout,
+                patch_size=patch_size,
+                max_channels=tc_former_max_channels,
+                max_patches=tc_former_max_patches,
+                use_revin=tc_former_use_revin,
+            )
+            param_count = sum(p.numel() for p in self.ts_encoder.parameters()) / 1e6
+            print(f" -> TS Encoder: TC-Former (d={ts_hidden_dim}, L={tc_former_layers}, "
+                  f"h={tc_former_heads}, ff={tc_former_ff_dim}, patch={patch_size}, "
+                  f"RevIN={tc_former_use_revin}, params={param_count:.1f}M)")
+        elif encoder_type == "patch":
             self.ts_encoder = PatchTokenizer(
                 hidden_dim=ts_hidden_dim,
                 patch_size=patch_size,
@@ -453,18 +477,20 @@ class MTSEmbedder(nn.Module):
                 norm_type=encoder_norm,
             )
             print(f" -> TS Encoder: CNN (stem_strides={resolved_stem_strides}, patch_size={patch_size})")
+
         self.projector = TimeSeriesProjector(ts_dim=ts_hidden_dim, llm_dim=self.llm_dim,
                                               hidden_dim=projector_hidden_dim)
         if projector_hidden_dim is not None:
-            print(f" -> Projector: {ts_hidden_dim}→{projector_hidden_dim}→{self.llm_dim} (P5 slim)")
+            print(f" -> Projector: {ts_hidden_dim}→{projector_hidden_dim}→{self.llm_dim} (slim)")
         else:
             print(f" -> Projector: {ts_hidden_dim}→{self.llm_dim*2}→{self.llm_dim} (default expansion 2×)")
 
         self.channel_mixer: Optional[ChannelMixer] = None
-        if channel_mixer:
+        if channel_mixer and encoder_type != "tc_former":
+            # TC-Former has built-in channel attention; ChannelMixer is redundant
             self.channel_mixer = ChannelMixer(ts_hidden_dim, num_heads=channel_mixer_heads,
                                               dropout=encoder_dropout)
-            print(f" -> ChannelMixer: {channel_mixer_heads} heads on {ts_hidden_dim}-dim features (P6)")
+            print(f" -> ChannelMixer: {channel_mixer_heads} heads on {ts_hidden_dim}-dim features")
 
         self.projector_norm = nn.LayerNorm(self.llm_dim)
         self.output_dim = output_dim

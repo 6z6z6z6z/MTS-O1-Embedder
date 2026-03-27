@@ -91,6 +91,13 @@ class ModelConfig:
     # P6: Cross-channel mixer; lightweight attention over C channels at each patch position
     channel_mixer: bool = False
     channel_mixer_heads: int = 4
+    # TC-Former encoder settings (encoder_type="tc_former")
+    tc_former_layers: int = 4          # number of TC-Former layers (Small=4, Base=6, Large=8)
+    tc_former_heads: int = 4           # attention heads (must divide ts_hidden_dim)
+    tc_former_ff_dim: int = 512        # FFN hidden dim (typically 4×ts_hidden_dim)
+    tc_former_max_channels: int = 64   # max channels for learnable channel embedding
+    tc_former_max_patches: int = 256   # max patches per channel for position embedding
+    tc_former_use_revin: bool = True   # use RevIN normalization (recommended)
     # Token IDs for TS-segment markers; Qwen2/3 use 151652/151653 by default.
     # For other model families, set these to the IDs of your chosen delimiter tokens.
     ts_marker_start_id: int = 151652

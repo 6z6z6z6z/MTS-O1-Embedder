@@ -370,6 +370,12 @@ def build_model(config):
         projector_hidden_dim=getattr(config.model, 'projector_hidden_dim', None),
         channel_mixer=getattr(config.model, 'channel_mixer', False),
         channel_mixer_heads=getattr(config.model, 'channel_mixer_heads', 4),
+        tc_former_layers=getattr(config.model, 'tc_former_layers', 4),
+        tc_former_heads=getattr(config.model, 'tc_former_heads', 4),
+        tc_former_ff_dim=getattr(config.model, 'tc_former_ff_dim', 512),
+        tc_former_max_channels=getattr(config.model, 'tc_former_max_channels', 64),
+        tc_former_max_patches=getattr(config.model, 'tc_former_max_patches', 256),
+        tc_former_use_revin=getattr(config.model, 'tc_former_use_revin', True),
     )
 
 

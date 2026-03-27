@@ -1,8 +1,8 @@
 __pycache__/
 *.pyc
 
-# Temporary local patch scripts
-patch*.py
+# Temporary local patch scripts (not mts_agent/models/patch_encoder.py)
+/patch*.py
 
 # Local evaluation artifacts
 retrieval_index.pkl
