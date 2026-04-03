@@ -112,6 +112,7 @@ class EpochLossTracker:
     total_contrastive_loss: float = 0.0
     total_cls_loss: float = 0.0
     total_proto_loss: float = 0.0
+    total_forecast_loss: float = 0.0
     effective_steps: int = 0
 
     def update(self, losses, scaled_total_loss):
@@ -120,6 +121,7 @@ class EpochLossTracker:
         self.total_contrastive_loss += float(losses['contrastive_loss'].item())
         self.total_cls_loss += float(losses['cls_loss'].item())
         self.total_proto_loss += float(losses['proto_loss'].item())
+        self.total_forecast_loss += float(losses.get('forecast_loss', torch.tensor(0.0)).item())
         self.effective_steps += 1
 
     def averages(self):
@@ -130,6 +132,7 @@ class EpochLossTracker:
                 'train_contrastive_loss': 0.0,
                 'train_cls_loss': 0.0,
                 'train_proto_loss': 0.0,
+                'train_forecast_loss': 0.0,
             }
 
         denom = float(self.effective_steps)
@@ -139,6 +142,7 @@ class EpochLossTracker:
             'train_contrastive_loss': self.total_contrastive_loss / denom,
             'train_cls_loss': self.total_cls_loss / denom,
             'train_proto_loss': self.total_proto_loss / denom,
+            'train_forecast_loss': self.total_forecast_loss / denom,
         }
 
 
@@ -461,6 +465,22 @@ class MTSTrainer:
         if self.proto_weight > 0:
             print(f"ProtoNCE enabled: weight={self.proto_weight}, proto_momentum={self.proto_momentum}")
 
+        # Forecasting (U+G unified training)
+        self.forecast_weight = float(run_config.get('forecast_weight', 0.0))
+        self.future_contrastive = bool(run_config.get('future_contrastive', False))
+        self.future_sim_reg_weight = float(run_config.get('future_sim_reg_weight', 0.0))
+        if self.forecast_weight > 0:
+            print(f"Forecasting head enabled: weight={self.forecast_weight}, "
+                  f"future_contrastive={self.future_contrastive}")
+        if self.future_sim_reg_weight > 0:
+            print(f"Future similarity regression enabled: weight={self.future_sim_reg_weight}")
+
+        # Asymmetric Bi-Encoder: gallery encodes history+future, query encodes history only.
+        self.asymmetric_biencoder = bool(run_config.get('asymmetric_biencoder', False))
+        if self.asymmetric_biencoder:
+            print("Asymmetric Bi-Encoder enabled: gallery=get_gallery_embedding(hist+fut), "
+                  "query=get_ts_only_embedding(hist). InfoNCE with diagonal positives.")
+
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         self.best_retrieval_accuracy = 0.0      # LOO on train (monitoring)
@@ -679,6 +699,58 @@ class MTSTrainer:
 
         return torch.from_numpy(weights)
 
+    def _compute_future_softclt_weights(self, future_ts: torch.Tensor) -> torch.Tensor:
+        """Compute in-batch [B, B] soft positive weights based on future trajectory distance.
+
+        Unlike _compute_softclt_weights (which uses class labels as hard gates),
+        this method treats ALL pairs as potential positives with weight proportional
+        to future similarity.  The diagonal (self) pair naturally gets weight ~1.0
+        after normalization.  Used for forecasting datasets without class labels.
+        """
+        import numpy as np
+        from scipy.spatial.distance import cdist
+
+        arr = future_ts.detach().cpu().numpy().astype(np.float32)
+        B = arr.shape[0]
+        flat = arr.reshape(B, -1)  # [B, C*H]
+        norms = np.linalg.norm(flat, axis=1, keepdims=True).clip(min=1e-8)
+        flat = flat / norms  # L2-normalise → distances in [0, 2]
+        dist_matrix = cdist(flat, flat, metric='euclidean')  # [B, B]
+        sigma = max(self.softclt_sigma, 1e-6)
+        weights = np.exp(-dist_matrix / sigma).astype(np.float32)
+        row_sums = weights.sum(axis=1, keepdims=True).clip(min=1e-8)
+        weights = weights / row_sums  # row-normalised
+        return torch.from_numpy(weights)
+
+    def _compute_future_sim_regression_loss(
+        self, emb: torch.Tensor, future_ts: torch.Tensor
+    ) -> torch.Tensor:
+        """Future Similarity Regression loss.
+
+        Directly trains the embedding space so that pairwise cosine similarities
+        match pairwise cosine similarities of the normalized future trajectories:
+
+            L = ||S_emb - S_future||²_F / B²
+
+        where S_emb[i,j]    = cos_sim(emb_i, emb_j)
+              S_future[i,j] = cos_sim(L2_norm(future_i), L2_norm(future_j))
+
+        This is more directly aligned with the RAF retrieval objective than InfoNCE:
+        it trains a smooth, global ordering rather than a batch-local classification.
+        No temperature, no sigma — the supervision is the future cosine similarity itself.
+        """
+        B = emb.shape[0]
+        # Normalize futures: [B, C*H]
+        flat = future_ts.float().reshape(B, -1)
+        flat = F.normalize(flat, p=2, dim=1)
+        S_future = torch.matmul(flat, flat.T)  # [B, B], values in [-1, 1]
+
+        # Normalize embeddings
+        emb_n = F.normalize(emb.float(), p=2, dim=1)
+        S_emb = torch.matmul(emb_n, emb_n.T)  # [B, B], values in [-1, 1]
+
+        return F.mse_loss(S_emb, S_future.detach())
+
     def _temp_tensor(self, device) -> torch.Tensor:
         """Return temperature as a scalar tensor. Gradients flow when learnable."""
         if self.log_temperature is not None:
@@ -723,6 +795,14 @@ class MTSTrainer:
         if ts_input_view2 is not None:
             ts_input_view2 = ts_input_view2.to(self.device).float()
 
+        future_ts = batch.get('future_ts')
+        if future_ts is not None:
+            future_ts = future_ts.to(self.device).float()
+
+        full_ts = batch.get('full_ts')
+        if full_ts is not None:
+            full_ts = full_ts.to(self.device).float()
+
         return {
             'ts_input': ts_input,
             'ts_input_view2': ts_input_view2,
@@ -733,6 +813,8 @@ class MTSTrainer:
             'labels': labels,
             'retrieval_input_ids': retrieval_input_ids,
             'retrieval_attention_mask': retrieval_attention_mask,
+            'future_ts': future_ts,
+            'full_ts': full_ts,
         }
 
     def _compute_batch_losses(self, tensors):
@@ -745,19 +827,62 @@ class MTSTrainer:
         labels = tensors['labels']
         retrieval_input_ids = tensors['retrieval_input_ids']
         retrieval_attention_mask = tensors['retrieval_attention_mask']
+        future_ts = tensors.get('future_ts')  # [B, C, H] or None
+        full_ts = tensors.get('full_ts')       # [B, C, T+H] or None (asymmetric bi-encoder)
 
         lm_loss = torch.tensor(0.0, device=self.device)
         contrastive_loss = torch.tensor(0.0, device=self.device)
         cls_loss = torch.tensor(0.0, device=self.device)
         proto_loss = torch.tensor(0.0, device=self.device)
+        forecast_loss = torch.tensor(0.0, device=self.device)
 
-        if self.training_stage == 'alignment' and (self.contrastive_weight > 0 or self.cls_weight > 0):
-            if self.ts_only_embedding:
+        query_emb = None  # populated below when needed for contrastive or forecast loss
+        future_sim_reg_loss = torch.tensor(0.0, device=self.device)
+
+        if self.training_stage == 'alignment' and (self.contrastive_weight > 0 or self.cls_weight > 0 or self.forecast_weight > 0 or self.future_sim_reg_weight > 0):
+            if self.asymmetric_biencoder and full_ts is not None:
+                # Asymmetric Bi-Encoder: query encodes history only, gallery encodes full trajectory.
+                # InfoNCE with diagonal positives: each history embedding is pulled toward
+                # its own history+future embedding. At inference, gallery is built with full_ts.
+                with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                    query_emb = self._raw_model.get_ts_only_embedding(ts_input)    # [B, D]
+                    gallery_emb = self._raw_model.get_gallery_embedding(full_ts)   # [B, D] — shared weights, grad flows both paths
+
+                if self.contrastive_weight > 0:
+                    q_n = F.normalize(query_emb.float(), p=2, dim=1)
+                    g_n = F.normalize(gallery_emb.float(), p=2, dim=1)
+                    sim = torch.matmul(q_n, g_n.T) / self._temp_tensor(query_emb.device)
+                    n = min(sim.size(0), sim.size(1))
+                    contrastive_loss = F.cross_entropy(sim[:n], torch.arange(n, device=sim.device))
+
+                if self.forecast_weight > 0 and future_ts is not None:
+                    fhead = getattr(self._raw_model, 'forecasting_head', None)
+                    if fhead is not None:
+                        pred = fhead(query_emb.to(fhead.linear.weight.dtype)).float()
+                        forecast_loss = F.mse_loss(pred, future_ts.float()[:, :pred.shape[1], :])
+
+            elif self.ts_only_embedding:
                 with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                     query_emb = self._raw_model.get_ts_only_embedding(ts_input)
 
                 if self.contrastive_weight > 0:
-                    contrastive_loss = self.compute_contrastive_from_embeddings(query_emb, class_labels)
+                    if self.future_contrastive and future_ts is not None:
+                        # Future-similarity soft InfoNCE for ts_only mode:
+                        # soft labels = exp(-||fut_i - fut_j|| / sigma), row-normalised.
+                        # This directly trains the encoder so that "similar future → similar embedding",
+                        # which is the property needed for RAF to outperform raw cosine retrieval.
+                        soft_weights = self._compute_future_softclt_weights(future_ts)
+                        emb_n = F.normalize(query_emb.float(), p=2, dim=1)
+                        sim = torch.matmul(emb_n, emb_n.T) / self._temp_tensor(query_emb.device)
+                        contrastive_loss = self.compute_multi_positive_nce(
+                            sim, soft_weights.to(query_emb.device)
+                        )
+                    else:
+                        contrastive_loss = self.compute_contrastive_from_embeddings(query_emb, class_labels)
+                if self.future_sim_reg_weight > 0 and future_ts is not None:
+                    future_sim_reg_loss = self._compute_future_sim_regression_loss(
+                        query_emb, future_ts.to(query_emb.device)
+                    )
                 if self.cls_weight > 0 and self.cls_head is not None:
                     cls_loss = self.compute_classification_loss(query_emb, class_labels)
             elif retrieval_input_ids is not None:
@@ -785,12 +910,26 @@ class MTSTrainer:
 
                 if self.contrastive_weight > 0:
                     if class_labels is None:
-                        # Diagonal InfoNCE: each query's positive is its own gallery entry
-                        q_n = F.normalize(query_emb.float(), p=2, dim=1)
-                        g_n = F.normalize(gallery_emb.detach().float(), p=2, dim=1)
-                        sim = torch.matmul(q_n, g_n.T) / self._temperature
-                        n = min(sim.size(0), sim.size(1))
-                        contrastive_loss = F.cross_entropy(sim[:n], torch.arange(n, device=sim.device))
+                        if self.future_contrastive and future_ts is not None:
+                            # Future-similarity soft InfoNCE (U+G unified):
+                            # soft labels from future trajectory distance — no class labels needed.
+                            soft_weights = self._compute_future_softclt_weights(future_ts)
+                            q_n = F.normalize(query_emb.float(), p=2, dim=1)
+                            g_n = F.normalize(gallery_emb.detach().float(), p=2, dim=1)
+                            sim = torch.matmul(q_n, g_n.T) / self._temp_tensor(query_emb.device)
+                            wmat = soft_weights.to(query_emb.device)
+                            valid = wmat.sum(dim=1) > 0
+                            if valid.any():
+                                contrastive_loss = self.compute_multi_positive_nce(
+                                    sim[valid], wmat[valid]
+                                )
+                        else:
+                            # Diagonal InfoNCE: each query's positive is its own gallery entry
+                            q_n = F.normalize(query_emb.float(), p=2, dim=1)
+                            g_n = F.normalize(gallery_emb.detach().float(), p=2, dim=1)
+                            sim = torch.matmul(q_n, g_n.T) / self._temperature
+                            n = min(sim.size(0), sim.size(1))
+                            contrastive_loss = F.cross_entropy(sim[:n], torch.arange(n, device=sim.device))
                     else:
                         # Get memory bank BEFORE updating: avoids current-batch duplicates.
                         # Skip bank during warmup: early embeddings are random and add noise.
@@ -848,11 +987,21 @@ class MTSTrainer:
                 )
             lm_loss = outputs.loss if outputs.loss is not None else torch.tensor(0.0, device=self.device)
 
+        # Forecasting loss: query embedding → predict future (U+G generation objective)
+        if self.forecast_weight > 0 and future_ts is not None:
+            fhead = getattr(self._raw_model, 'forecasting_head', None)
+            if fhead is not None and query_emb is not None:
+                pred = fhead(query_emb.to(fhead.linear.weight.dtype))  # [B, C, H]
+                target = future_ts.to(pred.device).to(pred.dtype)      # [B, C, H]
+                forecast_loss = torch.nn.functional.mse_loss(pred, target)
+
         loss = self._combine_weighted_losses(
             lm_loss,
             contrastive_loss,
             cls_loss,
             proto_loss,
+            forecast_loss,
+            future_sim_reg_loss,
         )
 
         return {
@@ -861,6 +1010,8 @@ class MTSTrainer:
             'contrastive_loss': contrastive_loss,
             'cls_loss': cls_loss,
             'proto_loss': proto_loss,
+            'forecast_loss': forecast_loss,
+            'future_sim_reg_loss': future_sim_reg_loss,
         }
 
     def _build_progress_postfix(self, losses):
@@ -873,17 +1024,27 @@ class MTSTrainer:
                 postfix['csloss'] = f"{losses['cls_loss'].item():.4f}"
             if self.proto_weight > 0:
                 postfix['ploss'] = f"{losses['proto_loss'].item():.4f}"
+            if self.forecast_weight > 0:
+                postfix['floss'] = f"{losses['forecast_loss'].item():.4f}"
+            if self.future_sim_reg_weight > 0:
+                postfix['srloss'] = f"{losses['future_sim_reg_loss'].item():.4f}"
         postfix['lloss'] = f"{losses['lm_loss'].item():.4f}"
         return postfix
 
-    def _combine_weighted_losses(self, lm_loss, contrastive_loss, cls_loss, proto_loss=None):
+    def _combine_weighted_losses(self, lm_loss, contrastive_loss, cls_loss, proto_loss=None, forecast_loss=None, future_sim_reg_loss=None):
         if proto_loss is None:
             proto_loss = torch.tensor(0.0, device=self.device)
+        if forecast_loss is None:
+            forecast_loss = torch.tensor(0.0, device=self.device)
+        if future_sim_reg_loss is None:
+            future_sim_reg_loss = torch.tensor(0.0, device=self.device)
         return (
             self.contrastive_weight * contrastive_loss
             + self.cls_weight * cls_loss
             + self.lm_weight * lm_loss
             + self.proto_weight * proto_loss
+            + self.forecast_weight * forecast_loss
+            + self.future_sim_reg_weight * future_sim_reg_loss
         )
 
     def _compute_eval_batch_loss(self, tensors):
@@ -907,6 +1068,13 @@ class MTSTrainer:
                 )
             else:
                 query_emb = self._raw_model.get_embedding(ts_input, alignment_input_ids)
+            # For forecasting datasets: return forecast MSE as val loss
+            future_ts = tensors.get('future_ts')
+            fhead = getattr(self._raw_model, 'forecasting_head', None)
+            if fhead is not None and future_ts is not None:
+                pred = fhead(query_emb.to(fhead.linear.weight.dtype))
+                target = future_ts.to(pred.device).to(pred.dtype)
+                return F.mse_loss(pred, target)
             return self.compute_classification_loss(query_emb, class_labels)
 
         lm_loss = torch.tensor(0.0, device=self.device)
@@ -1322,12 +1490,16 @@ class MTSTrainer:
         avg_lm_loss = averages['train_lm_loss']
         avg_proto_loss = averages['train_proto_loss']
 
+        avg_forecast_loss = averages.get('train_forecast_loss', 0.0)
+        avg_future_sim_reg_loss = averages.get('train_future_sim_reg_loss', 0.0)
         if self.training_stage == 'alignment':
             proto_str = f", PL: {avg_proto_loss:.4f}" if self.proto_weight > 0 else ""
+            forecast_str = f", FL: {avg_forecast_loss:.4f}" if self.forecast_weight > 0 else ""
+            sim_reg_str = f", SR: {avg_future_sim_reg_loss:.4f}" if self.future_sim_reg_weight > 0 else ""
             train_msg = (
                 f"Epoch {epoch+1} finished. Train Loss: {train_loss:.4f} "
                 f"(CL: {avg_contrastive_loss:.4f}, CS: {avg_cls_loss:.4f}, "
-                f"LM: {avg_lm_loss:.4f}{proto_str})"
+                f"LM: {avg_lm_loss:.4f}{proto_str}{forecast_str}{sim_reg_str})"
             )
         else:
             train_msg = f"Epoch {epoch+1} finished. Train Loss: {train_loss:.4f}"

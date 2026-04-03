@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 
-ModeType = Literal["gen_data", "train"]
+ModeType = Literal["gen_data", "train", "eval_raf"]
 EncoderNormType = Literal["group", "batch"]
 EmbeddingPoolingType = Literal["mean", "last", "ts_tokens", "latent"]
 TuningStrategyType = Literal["full", "freeze", "partial", "lora"]
@@ -64,6 +64,19 @@ class DataConfig:
     augment: bool = True
     max_length: int = 1024
     domain_info: Optional[str] = None
+    # Forecasting dataset settings (used when dataset_type="forecasting")
+    dataset_type: str = "classification"  # "classification" | "forecasting"
+    history_len: int = 96                 # input window length
+    forecast_horizon: int = 96           # output prediction length
+    train_end_ratio: float = 0.6         # fraction of data for training
+    val_end_ratio: float = 0.8           # fraction for train+val (rest = test)
+    forecast_stride: int = 1             # sliding window stride for training
+    gallery_stride: int = 1              # stride for RAF gallery (default=1 → dense; usually < forecast_stride)
+    val_stride: int = 1                  # stride for validation set (increase to speed up per-epoch val with large LLMs)
+    use_freq_features: bool = False      # append FFT magnitude as extra channels (TF-C inspired)
+    use_decomp_features: bool = False    # append trend+seasonal decomposition as extra channels (CoST inspired)
+    decomp_kernel: int = 25              # moving-average kernel size for trend extraction (use odd number)
+    context_file: Optional[str] = None   # path to JSON file with per-window context strings (for LLM semantic embedding)
 
 @dataclass
 class ModelConfig:
@@ -105,6 +118,11 @@ class ModelConfig:
     # when embedding_pooling="latent". K learnable queries cross-attend all hidden states.
     latent_pooling_num_latents: int = 8   # number of learnable latent queries
     latent_pooling_heads: int = 8         # attention heads in cross-attention
+    # Forecasting head output channels (raw channels, before any freq augmentation)
+    # If None, defaults to ts_input_dim. Set to raw CSV channel count when use_freq_features=True.
+    forecast_channels: Optional[int] = None
+    # Skip LLM loading entirely (ts_only training/eval). llm_dim=output_dim, much faster startup.
+    ts_only_mode: bool = False
     # Token IDs for TS-segment markers; Qwen2/3 use 151652/151653 by default.
     # For other model families, set these to the IDs of your chosen delimiter tokens.
     ts_marker_start_id: int = 151652
@@ -153,6 +171,15 @@ class TrainingConfig:
     proto_weight: float = 0.0  # Weight for prototype-NCE loss; 0.0 = disabled
     proto_momentum: float = 0.9  # EMA momentum for class prototype update
     llm_lr_scale: float = 1.0   # LR multiplier for LLM LoRA params; < 1.0 = layer-wise LR decay
+    # Forecasting-specific training settings
+    forecast_weight: float = 0.0     # weight for MSE forecasting loss (0 = disabled)
+    future_contrastive: bool = False  # use future trajectory distance as SoftCLT soft labels
+    future_sim_reg_weight: float = 0.0  # weight for future similarity regression loss:
+    # Asymmetric Bi-Encoder: gallery encoder sees history+future, query encoder sees history only.
+    # InfoNCE(query_emb(hist), gallery_emb(hist+fut)) with diagonal positives.
+    # At RAF time, gallery embeddings are built with get_gallery_embedding(full_ts).
+    asymmetric_biencoder: bool = False
+                                        # trains cos_sim(emb_i, emb_j) ≈ cos_sim(future_i, future_j)
 
 @dataclass
 class RetrievalConfig:

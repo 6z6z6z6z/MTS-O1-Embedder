@@ -176,6 +176,10 @@ from mts_agent.config import ExperimentConfig, create_config_from_args
 from mts_agent.data.adapters import infer_ts_input_dim
 from mts_agent.data.loader import MTSDataset
 from mts_agent.data.collator import MultimodalCollator
+from mts_agent.data.forecasting_dataset import build_forecasting_splits
+from mts_agent.eval.raf_eval import (run_raf_eval, print_raf_results,
+                                      run_classical_raf_baselines, print_classical_results,
+                                      run_p2r_raf_eval, print_p2r_results)
 from mts_agent.models.mts_embedder import MTSEmbedder
 from mts_agent.engine.trainer import MTSTrainer
 from mts_agent.tokenization import DummyTokenizer
@@ -349,9 +353,48 @@ def prepare_training_datasets(config):
     return full_train_dataset, None, test_dataset
 
 
+def prepare_forecasting_datasets(config):
+    """Build ForecastingDataset train/val/test splits from a CSV file.
+
+    Uses temporal splits (no shuffling) to prevent look-ahead bias.
+    Returns (train_dataset, val_dataset, test_dataset).
+    """
+    csv_path = config.data.data_path
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Forecasting CSV not found: {csv_path}\n"
+            "Download ETT/Weather/Traffic datasets and point data_path at the CSV."
+        )
+    train_ds, val_ds, test_ds, gallery_ds = build_forecasting_splits(
+        csv_path=csv_path,
+        history_len=getattr(config.data, 'history_len', 96),
+        forecast_horizon=getattr(config.data, 'forecast_horizon', 96),
+        stride=getattr(config.data, 'forecast_stride', 1),
+        gallery_stride=getattr(config.data, 'gallery_stride', 1),
+        train_end_ratio=getattr(config.data, 'train_end_ratio', 0.6),
+        val_end_ratio=getattr(config.data, 'val_end_ratio', 0.8),
+        augment_train=config.data.augment,
+        use_freq_features=getattr(config.data, 'use_freq_features', False),
+        use_decomp_features=getattr(config.data, 'use_decomp_features', False),
+        decomp_kernel=getattr(config.data, 'decomp_kernel', 25),
+        context_file=getattr(config.data, 'context_file', None),
+        val_stride=getattr(config.data, 'val_stride', 1),
+    )
+    # Backfill ts_dim from actual data so the model is built with the right channel count
+    if config.data.ts_dim is None:
+        config.data.ts_dim = train_ds.num_channels
+    if config.model.ts_input_dim is None:
+        config.model.ts_input_dim = train_ds.num_channels
+    return train_ds, val_ds, test_ds, gallery_ds
+
+
 def build_model(config):
     """Construct the embedder from the resolved config."""
     print("Initializing Model...")
+    # For forecasting datasets, attach a ForecastingHead sized to (ts_input_dim, forecast_horizon)
+    forecast_horizon = 0
+    if getattr(config.data, 'dataset_type', 'classification') == 'forecasting':
+        forecast_horizon = getattr(config.data, 'forecast_horizon', 0)
     return MTSEmbedder(
         config.model.llm_path,
         ts_hidden_dim=config.model.ts_hidden_dim,
@@ -379,12 +422,20 @@ def build_model(config):
         use_bidirectional_attn=getattr(config.model, 'use_bidirectional_attn', False),
         latent_pooling_num_latents=getattr(config.model, 'latent_pooling_num_latents', 8),
         latent_pooling_heads=getattr(config.model, 'latent_pooling_heads', 8),
+        ts_input_dim=config.model.ts_input_dim or 1,
+        forecast_horizon=forecast_horizon,
+        forecast_channels=getattr(config.model, 'forecast_channels', None),
+        llm_load_to_cpu=getattr(config.training, 'ts_only_embedding', False),
+        ts_only_mode=getattr(config.model, 'ts_only_mode', False),
     )
 
 
 def apply_tuning_strategy(model, config):
     """Apply the requested LLM tuning strategy and keep TS modules trainable."""
-    if config.model.tuning_strategy == "freeze":
+    ts_only = getattr(config.model, 'ts_only_mode', False)
+    if ts_only:
+        print("Strategy: ts_only_mode=True — LLM stub present, skipping LLM tuning strategy.")
+    elif config.model.tuning_strategy == "freeze":
         print("Strategy: Freezing LLM Backbone (Stage 1)...")
         model.freeze_llm()
     elif config.model.tuning_strategy == "partial":
@@ -401,6 +452,9 @@ def apply_tuning_strategy(model, config):
         param.requires_grad = True
     for param in model.ts_encoder.parameters():
         param.requires_grad = True
+    if getattr(model, 'forecasting_head', None) is not None:
+        for param in model.forecasting_head.parameters():
+            param.requires_grad = True
 
 
 def load_checkpoint_if_available(model, config):
@@ -479,6 +533,10 @@ def build_run_config(config):
         'weight_decay': getattr(config.training, 'weight_decay', 0.01),
         'loo_smoothing_window': getattr(config.training, 'loo_smoothing_window', 3),
         'llm_lr_scale': getattr(config.training, 'llm_lr_scale', 1.0),
+        'forecast_weight': getattr(config.training, 'forecast_weight', 0.0),
+        'future_contrastive': getattr(config.training, 'future_contrastive', False),
+        'future_sim_reg_weight': getattr(config.training, 'future_sim_reg_weight', 0.0),
+        'asymmetric_biencoder': getattr(config.training, 'asymmetric_biencoder', False),
     }
 
 
@@ -529,7 +587,7 @@ def run_single_stage_training(config, tokenizer, train_dataset, eval_dataset, te
 
 def main():
     parser = argparse.ArgumentParser(description="MTS-O1-Embedder: Multimodal Time Series Embedding Agent")
-    parser.add_argument("--mode", type=str, default="train", choices=["train"], help="Operation mode")
+    parser.add_argument("--mode", type=str, default="train", choices=["train", "eval_raf"], help="Operation mode")
     
     # Paths
     parser.add_argument("--data_path", type=str, default="mts_agent/data/processed/mock_train.jsonl")
@@ -626,23 +684,96 @@ def main():
     )
     set_global_seed(config.training.seed)
 
-    resolve_ts_dimensions(config)
+    dataset_type = getattr(config.data, 'dataset_type', 'classification')
+    if dataset_type != 'forecasting':
+        resolve_ts_dimensions(config)
 
-    print(f"=== Starting Training Setup: {config.experiment_name} ===")
+    mode = getattr(config, 'mode', 'train')
 
     tokenizer = load_local_tokenizer(config.model.llm_path, config.environment.use_dummy_tokenizer)
-    train_dataset, eval_dataset, test_dataset = prepare_training_datasets(config)
 
-    run_single_stage_training(
-        config=config,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        test_dataset=test_dataset,
-        stage_name=config.training.training_stage,
-        ckpt_path=config.training.ckpt_path,
-        save_dir=config.training.save_dir,
-    )
+    if dataset_type == 'forecasting':
+        train_dataset, eval_dataset, test_dataset, gallery_dataset = prepare_forecasting_datasets(config)
+    else:
+        train_dataset, eval_dataset, test_dataset = prepare_training_datasets(config)
+        gallery_dataset = train_dataset  # classification: gallery == train
+
+    if mode == 'eval_raf':
+        print(f"=== RAF Evaluation: {config.experiment_name} ===")
+        collator = MultimodalCollator(
+            tokenizer, mode='train',
+            max_length=config.data.max_length,
+            alignment_text_mode=config.training.alignment_text_mode,
+        )
+        device = torch.device(config.environment.device if torch.cuda.is_available() else 'cpu')
+        model = build_model(config)
+        apply_tuning_strategy(model, config)
+
+        ckpt_path = config.training.ckpt_path
+        if ckpt_path is None:
+            best_path = os.path.join(config.training.save_dir, 'model_best.pt')
+            last_path = os.path.join(config.training.save_dir, 'model_last.pt')
+            ckpt_path = best_path if os.path.exists(best_path) else last_path
+        if ckpt_path and os.path.exists(ckpt_path):
+            print(f"Loading checkpoint from {ckpt_path}...")
+            state_dict = torch.load(ckpt_path, map_location=device)
+            model_state = model.state_dict()
+            filtered = {k: v for k, v in state_dict.items()
+                        if k in model_state and v.shape == model_state[k].shape}
+            model.load_state_dict(filtered, strict=False)
+            print(f"Loaded {len(filtered)}/{len(model_state)} params from checkpoint.")
+        else:
+            print(f"WARNING: no checkpoint found at {ckpt_path}, using random weights")
+
+        # ts_only eval: LLM stays on CPU (was loaded there), only move ts_encoder + projector to GPU.
+        # Calling model.to(device) would move the entire 4B LLM onto GPU and cause OOM.
+        if config.training.ts_only_embedding and hasattr(model, 'llm') and model.llm is not None:
+            for name, module in model.named_children():
+                if name != 'llm':
+                    module.to(device)
+            print("ts_only eval: LLM kept on CPU; ts_encoder + projector moved to GPU.")
+        else:
+            model = model.to(device)
+
+        model.eval()
+
+        k_values = [1, 3, 5, 10, 20, 50, 100]
+        _asym = getattr(config.training, 'asymmetric_biencoder', False)
+        results = run_raf_eval(
+            model, gallery_dataset, test_dataset, collator, device,
+            k_values=k_values, batch_size=config.data.batch_size,
+            ts_only=config.training.ts_only_embedding,
+            asymmetric_biencoder=_asym,
+        )
+        print_raf_results(results)
+
+        print("\nRunning Predict-then-Retrieve (P2R) evaluation...")
+        p2r = run_p2r_raf_eval(
+            model, gallery_dataset, test_dataset, collator, device,
+            k_values=k_values, batch_size=config.data.batch_size,
+            ts_only=config.training.ts_only_embedding,
+        )
+        if p2r:
+            print_p2r_results(p2r, k_values=k_values)
+
+        print("\nRunning classical retrieval baselines (Euclidean / Cosine on raw TS)...")
+        classical = run_classical_raf_baselines(
+            gallery_dataset, test_dataset, collator, device,
+            k_values=k_values, batch_size=config.data.batch_size,
+        )
+        print_classical_results(classical, k_values=k_values)
+    else:
+        print(f"=== Starting Training Setup: {config.experiment_name} ===")
+        run_single_stage_training(
+            config=config,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            test_dataset=test_dataset,
+            stage_name=config.training.training_stage,
+            ckpt_path=config.training.ckpt_path,
+            save_dir=config.training.save_dir,
+        )
 
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()

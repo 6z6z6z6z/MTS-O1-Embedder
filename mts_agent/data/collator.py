@@ -104,6 +104,22 @@ class MultimodalCollator:
             ts_batch_view2 = self._pad_time_series_batch(batch, key='time_series_view2')
         else:
             ts_batch_view2 = ts_batch
+
+        # Forecasting: batch the future targets and normalization stats if present
+        future_batch = None
+        if 'future' in batch[0] and batch[0]['future'] is not None:
+            future_batch = self._pad_time_series_batch(batch, key='future')
+
+        hist_mean_batch = None
+        hist_std_batch = None
+        if 'hist_mean' in batch[0] and batch[0]['hist_mean'] is not None:
+            hist_mean_batch = torch.stack([item['hist_mean'] for item in batch])  # [B, C, 1]
+            hist_std_batch = torch.stack([item['hist_std'] for item in batch])    # [B, C, 1]
+
+        # Asymmetric bi-encoder: full trajectory (history+future) for gallery encoder
+        full_ts_batch = None
+        if 'full_ts' in batch[0] and batch[0]['full_ts'] is not None:
+            full_ts_batch = self._pad_time_series_batch(batch, key='full_ts')
         
         # 2. Process Text
         # We need to construct the full text for the LLM.
@@ -141,6 +157,10 @@ class MultimodalCollator:
             "labels": lm_labels,             # [Batch, Seq_Len] (Token Labels for Next Token Prediction)
             "label": class_labels,           # [Batch] (Classification Labels for Evaluation)
             "id": ids,                       # [Batch] (Sample IDs)
+            "future_ts": future_batch,       # [Batch, Dim, H] or None (forecasting target)
+            "hist_mean": hist_mean_batch,    # [Batch, C, 1] or None (per-window history mean)
+            "hist_std": hist_std_batch,      # [Batch, C, 1] or None (per-window history std)
+            "full_ts": full_ts_batch,        # [Batch, C, T+H] or None (for asymmetric bi-encoder)
         }
 
         if self.include_debug_text:

@@ -7,10 +7,25 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+from types import SimpleNamespace
 from transformers import AutoModelForCausalLM
 from .ts_encoder import TimeSeriesEncoder, PatchTokenizer, ChannelMixer
 from .projector import TimeSeriesProjector
 from .patch_encoder import TCFormer
+
+
+class _TSOnlyStub(nn.Module):
+    """Lightweight nn.Module placeholder for ts_only_mode=True.
+
+    Carries no trainable parameters — it purely provides a `.config.hidden_size`
+    attribute so that MTSEmbedder can size the projector/norms to `output_dim`
+    without loading 4 B LLM weights.  All trainer code that iterates
+    `llm.parameters()` or calls `llm.to(device)` works correctly on an empty module.
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(hidden_size=hidden_size)
 
 
 class LatentAttentionPooling(nn.Module):
@@ -40,7 +55,9 @@ class LatentAttentionPooling(nn.Module):
             [B, d_model] global representation
         """
         B = hidden_states.shape[0]
-        queries = self.latent_queries.unsqueeze(0).expand(B, -1, -1)  # [B, K, d]
+        target_dtype = self.cross_attn.in_proj_weight.dtype
+        hidden_states = hidden_states.to(target_dtype)
+        queries = self.latent_queries.unsqueeze(0).expand(B, -1, -1).to(target_dtype)  # [B, K, d]
         key_padding_mask = None
         if attention_mask is not None:
             key_padding_mask = (attention_mask == 0)  # True = ignore
@@ -52,6 +69,22 @@ class LatentAttentionPooling(nn.Module):
         )
         pooled = self.norm(pooled)  # [B, K, d]
         return pooled.mean(dim=1)   # [B, d]
+
+
+class ForecastingHead(nn.Module):
+    """Linear head that maps a fixed-size embedding to a multi-step forecast.
+
+    Input:  [B, input_dim]
+    Output: [B, ts_input_dim, forecast_horizon]  (channel-first, normalized space)
+    """
+    def __init__(self, input_dim: int, ts_input_dim: int, forecast_horizon: int) -> None:
+        super().__init__()
+        self.ts_input_dim = ts_input_dim
+        self.forecast_horizon = forecast_horizon
+        self.linear = nn.Linear(input_dim, ts_input_dim * forecast_horizon)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x).reshape(x.shape[0], self.ts_input_dim, self.forecast_horizon)
 
 
 class MTSEmbedder(nn.Module):
@@ -226,6 +259,7 @@ class MTSEmbedder(nn.Module):
         llm_model_path: str,
         allow_llm_fallback: bool,
         llm_attn_implementation: str,
+        load_to_cpu: bool = False,
     ) -> nn.Module:
         print(f"Loading LLM from {llm_model_path}...")
         try:
@@ -248,8 +282,11 @@ class MTSEmbedder(nn.Module):
             # DDP's device management, causing CUDA illegal memory access when tensors
             # end up under different device-placement regimes.  DDP wrapper handles
             # device placement instead.  Single-GPU keeps device_map for fast loading.
+            # When load_to_cpu=True (ts_only_embedding mode), keep LLM on CPU to save GPU VRAM.
             if _is_ddp:
                 print(f" -> DDP mode (world_size={_world_size}): loading to CPU, DDP will move to cuda:{_local_rank}.")
+            elif load_to_cpu:
+                print(f" -> ts_only mode: loading LLM to CPU to preserve GPU VRAM for ts_encoder/projector.")
             else:
                 load_kwargs["device_map"] = {"": _local_rank}
                 print(f" -> Loading directly to cuda:{_local_rank} (device_map, skips CPU staging).")
@@ -527,11 +564,28 @@ class MTSEmbedder(nn.Module):
         # Phase 2: latent attention pooling (NV-Embed) — activated when embedding_pooling="latent"
         latent_pooling_num_latents: int = 8,
         latent_pooling_heads: int = 8,
+        # Forecasting head (U+G unified training)
+        ts_input_dim: int = 1,       # number of input channels (needed for ForecastingHead output size)
+        forecast_horizon: int = 0,   # 0 = disabled; > 0 = attach ForecastingHead
+        forecast_channels: Optional[int] = None,  # raw output channels for ForecastingHead; defaults to ts_input_dim
+        # When True, load the LLM onto CPU instead of GPU to preserve GPU VRAM
+        # (useful when ts_only_embedding=True and the GPU has limited free memory)
+        llm_load_to_cpu: bool = False,
+        # When True, skip LLM loading entirely (ts_only training/eval only).
+        # llm_dim is set to output_dim, making the projector ts_hidden_dim→output_dim.
+        # Saves 30-60s startup time, ~8 GB RAM, and allows much smaller checkpoints.
+        ts_only_mode: bool = False,
     ) -> None:
         super().__init__()
         resolved_stem_strides = list(stem_strides) if stem_strides is not None else [5, 5]
         self.allow_llm_fallback = allow_llm_fallback
-        self.llm = self._load_llm(llm_model_path, allow_llm_fallback, llm_attn_implementation)
+        if ts_only_mode:
+            # No LLM weights loaded; stub provides .config.hidden_size = output_dim
+            self.llm = _TSOnlyStub(hidden_size=output_dim)
+            print(f" -> ts_only_mode: LLM skipped entirely. llm_dim={output_dim} (=output_dim)")
+        else:
+            self.llm = self._load_llm(llm_model_path, allow_llm_fallback, llm_attn_implementation,
+                                      load_to_cpu=llm_load_to_cpu)
 
         self.llm_dim = self.llm.config.hidden_size
 
@@ -606,6 +660,15 @@ class MTSEmbedder(nn.Module):
                   f"{latent_pooling_heads} heads")
         if use_bidirectional_attn:
             print(" -> Bidirectional attention: enabled (causal mask removed — use only with MHA models)")
+
+        # Forecasting head: embedding → [B, C, H] future prediction
+        self.ts_input_dim = ts_input_dim
+        _forecast_c = forecast_channels if forecast_channels is not None else ts_input_dim
+        self.forecasting_head: Optional[ForecastingHead] = None
+        if forecast_horizon > 0:
+            self.forecasting_head = ForecastingHead(output_dim, _forecast_c, forecast_horizon)
+            print(f" -> ForecastingHead: {output_dim}→{_forecast_c}×{forecast_horizon} "
+                  f"(C={_forecast_c}, H={forecast_horizon})")
 
     def _get_ts_token_mask(self, text_input_ids, ts_seq_len, max_seq_len):
         """Return float mask (B, max_seq_len) with 1.0 at TS token positions.
@@ -832,6 +895,21 @@ class MTSEmbedder(nn.Module):
             return_dict=True,
         )
         return outputs
+
+    def get_gallery_embedding(self, full_ts: torch.Tensor) -> torch.Tensor:
+        """Embed full trajectory (history+future) for asymmetric bi-encoder gallery.
+
+        Gallery encoder sees [C, T+H] (history concatenated with future).
+        At retrieval time, query encoder sees [C, T] (history only), so the
+        similarity between query and gallery is future-informed: windows with
+        similar histories AND similar futures land close together.
+
+        Uses the same ts_encoder/projector weights as get_ts_only_embedding;
+        variable input length is handled transparently by TCFormer / CNN encoder.
+        """
+        ts_norm = self._encode_ts_tokens(full_ts)
+        emb = ts_norm.mean(dim=1)   # [B, llm_dim]
+        return self.final_projection(emb)
 
     def get_ts_only_embedding(self, ts_input):
         """Embed TS using only the TS encoder and projector — no LLM forward.
